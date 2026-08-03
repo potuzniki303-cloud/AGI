@@ -498,3 +498,106 @@ def test_bad_action_is_rejected():
 def test_allow_stay_adds_action():
     assert make("forage", allow_stay=False).action_size == 4
     assert make("forage", allow_stay=True).action_size == 5
+
+
+# ----------------------------------------------------------- переходник
+
+class FakeAgent:
+    """Имитирует интерфейс src/agent: forward() -> логиты, mutate() -> потомок.
+
+    Нужен потому, что torch в этом контейнере не ставится, а проверить
+    перевод forward/mutate -> act/spawn всё равно надо."""
+
+    def __init__(self, logits, generation=0):
+        self.logits = np.asarray(logits, dtype=np.float32)
+        self.generation = generation
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return self.logits
+
+    def mutate(self):
+        return FakeAgent(self.logits, self.generation + 1)
+
+
+class FakeTensor:
+    """Утиный torch.Tensor: detach/cpu/numpy."""
+
+    def __init__(self, arr): self._arr = np.asarray(arr)
+    def detach(self): return self
+    def cpu(self): return self
+    def numpy(self): return self._arr
+
+
+def test_adapter_argmax():
+    from world.adapters import MindAdapter
+
+    m = MindAdapter(FakeAgent([0.1, 0.9, 0.2, 0.3]), 4,
+                    np.random.default_rng(0), temperature=0.0)
+    assert m.act(np.zeros(5, dtype=np.float32)) == 1
+
+
+def test_adapter_samples_within_range():
+    from world.adapters import MindAdapter
+
+    m = MindAdapter(FakeAgent([0.0, 0.0, 0.0, 0.0]), 4,
+                    np.random.default_rng(0), temperature=1.0)
+    acts = {m.act(np.zeros(5, dtype=np.float32)) for _ in range(200)}
+    assert acts <= {0, 1, 2, 3}
+    assert len(acts) > 1, "при равных логитах выбор должен быть случайным"
+
+
+def test_adapter_uses_only_first_n_logits():
+    from world.adapters import MindAdapter
+
+    # хвост логитов — скрытое состояние, действием он быть не должен
+    m = MindAdapter(FakeAgent([0.1, 0.2, 0.3, 0.4, 9.9, 9.9]), 4,
+                    np.random.default_rng(0), temperature=0.0)
+    assert m.act(np.zeros(5, dtype=np.float32)) == 3
+
+
+def test_adapter_spawn_calls_mutate():
+    from world.adapters import MindAdapter
+
+    m = MindAdapter(FakeAgent([1.0, 0, 0, 0]), 4, np.random.default_rng(0))
+    child = m.spawn(np.random.default_rng(1))
+    assert child.agent.generation == 1
+    assert child.agent is not m.agent
+    assert child.temperature == m.temperature
+
+
+def test_adapter_unwraps_tensor_like():
+    from world.adapters import MindAdapter
+
+    class TensorAgent(FakeAgent):
+        def forward(self, x): return FakeTensor(self.logits)
+
+    m = MindAdapter(TensorAgent([0.0, 0.0, 5.0, 0.0]), 4,
+                    np.random.default_rng(0), temperature=0.0)
+    assert m.act(np.zeros(5, dtype=np.float32)) == 2
+
+
+def test_adapter_rejects_non_finite_logits():
+    """Разошедшиеся веса должны падать, а не превращаться в действие 0.
+
+    Иначе получится агент, который «умеет ходить на север», хотя он сломан."""
+    from world.adapters import MindAdapter
+
+    m = MindAdapter(FakeAgent([np.nan, 0, 0, 0]), 4, np.random.default_rng(0))
+    with pytest.raises(FloatingPointError, match="нечисловые"):
+        m.act(np.zeros(5, dtype=np.float32))
+
+
+def test_adapter_runs_in_world():
+    from world.adapters import MindAdapter
+
+    w = make("forage", seed=1)
+    h = simulate(
+        w,
+        lambda rng: MindAdapter(
+            FakeAgent(np.zeros(w.action_size)), w.action_size, rng, temperature=1.0
+        ),
+        steps=200,
+    )
+    assert h.ticks > 0
