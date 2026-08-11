@@ -20,7 +20,7 @@ from __future__ import annotations
 import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -108,7 +108,13 @@ class Body:
 
 @dataclass
 class StepReport:
-    """Наблюдательская сводка за такт. Никуда не возвращается в симуляцию."""
+    """Наблюдательская сводка за такт. Никуда не возвращается в симуляцию.
+
+    born/died — журнал событий. Он нужен тому, кто держит агентов снаружи
+    (gym-обёртка): мир сообщает «тело 12 породило тело 47» и «тело 3 умерло»,
+    а решение, что делать с их разумами, принимает вызывающий. Мир при этом
+    не трогает ни одного объекта Mind.
+    """
 
     tick: int
     population: int
@@ -119,6 +125,8 @@ class StepReport:
     mean_energy: float
     mean_age: float
     extinct: bool
+    born: list[tuple[int, int]] = field(default_factory=list)  # (родитель, потомок)
+    died: list[int] = field(default_factory=list)
 
 
 class World(ABC):
@@ -194,10 +202,16 @@ class World(ABC):
 
     # -------------------------------------------------------------- запуск
 
-    def reset(self, mind_factory: Callable[[np.random.Generator], Mind]) -> None:
+    def reset(
+        self, mind_factory: Callable[[np.random.Generator], Mind] | None = None
+    ) -> None:
         """Заселить мир. mind_factory создаёт независимые случайные геномы.
 
         Мир не выбирает, кого заселять: он вызывает фабрику N раз и всё.
+
+        mind_factory=None — режим, в котором разумы держит вызывающий
+        (см. gym_env.py). Тела создаются без mind, действия приходят снаружи,
+        а о рождениях и смертях мир сообщает журналом в StepReport.
         """
         self.rng = np.random.default_rng(self.cfg.seed)
         self.food[:] = 0
@@ -217,43 +231,52 @@ class World(ABC):
                 x=int(x),
                 y=int(y),
                 energy=self.cfg.energy_at_birth,
-                mind=mind_factory(self.rng),
+                mind=mind_factory(self.rng) if mind_factory is not None else None,
                 born_at=0,
             )
             self._on_birth(body, body)
             self.bodies.append(body)
             self.occupancy[body.y, body.x] += 1
 
-    def step(self) -> StepReport:
+    def observe_all(self) -> tuple[list[int], list[np.ndarray]]:
+        """Наблюдения всех живых тел по одному снимку мира.
+
+        Снимок один на всех намеренно: если бы тела воспринимали мир
+        вперемешку с движением, порядок в списке давал бы преимущество,
+        то есть в симуляцию протёк бы отбор по позиции в массиве.
+        """
+        return [b.id for b in self.bodies], [self.observe(b) for b in self.bodies]
+
+    def apply_actions(self, actions: Sequence[int]) -> StepReport:
+        """Физика такта по готовым действиям. Ни одного обращения к Mind,
+        кроме spawn() при делении — и то лишь если разумы держит сам мир.
+
+        actions идут в том же порядке, что и observe_all().
+        """
         if self.extinct:
             return self._report(0, 0, 0)
+        if len(actions) != len(self.bodies):
+            raise ValueError(
+                f"нужно {len(self.bodies)} действий, получено {len(actions)}"
+            )
 
-        # 1-2. одновременное восприятие, затем решения
-        actions: list[int] = []
-        for body in self.bodies:
-            obs = self.observe(body)
-            a = int(body.mind.act(obs))
-            if not 0 <= a < self.action_size:
+        for a in actions:
+            if not 0 <= int(a) < self.action_size:
                 raise ValueError(
-                    f"mind returned action {a}, expected [0, {self.action_size})"
+                    f"action {a} out of range, expected [0, {self.action_size})"
                 )
-            actions.append(a)
 
-        # 3. применение в случайном порядке
+        # применение в случайном порядке — по той же причине, что и снимок
         eaten = 0
         for i in self.rng.permutation(len(self.bodies)):
             body = self.bodies[i]
-            eaten += self._apply(body, actions[i])
+            eaten += self._apply(body, int(actions[i]))
             body.age += 1
             self._perturb(body)
 
-        # 4. смерть
-        deaths = self._reap()
+        deaths, died = self._reap()
+        births, born = self._reproduce()
 
-        # 5. размножение
-        births = self._reproduce()
-
-        # 6. еда
         self._decay()
         self._regrow()
 
@@ -263,7 +286,23 @@ class World(ABC):
         if not self.bodies:
             self.extinct = True
 
-        return self._report(births, deaths, eaten)
+        report = self._report(births, deaths, eaten)
+        report.born = born
+        report.died = died
+        return report
+
+    def step(self) -> StepReport:
+        """Такт, в котором действия спрашиваются у разумов самого мира.
+
+        Удобная обёртка над observe_all()/apply_actions() для случая, когда
+        популяцию держит мир. Через gym работает второй путь.
+        """
+        if self.extinct:
+            return self._report(0, 0, 0)
+
+        _, observations = self.observe_all()
+        actions = [int(b.mind.act(o)) for b, o in zip(self.bodies, observations)]
+        return self.apply_actions(actions)
 
     # ------------------------------------------------------------ механика
 
@@ -301,32 +340,32 @@ class World(ABC):
         self.occupancy[y, x] += 1
         return x, y
 
-    def _reap(self) -> int:
+    def _reap(self) -> tuple[int, list[int]]:
         """Смерть. Единственный фильтр в этом мире.
 
         Заметь: ничего не сравнивается ни с чем. Нет «худших». Есть только
         «энергия кончилась» — локальный факт про одно тело.
         """
         survivors: list[Body] = []
-        dead = 0
+        died: list[int] = []
         for body in self.bodies:
             too_old = self.cfg.max_age is not None and body.age >= self.cfg.max_age
             if body.energy <= 0.0 or too_old:
                 self.occupancy[body.y, body.x] -= 1
                 self._lifespans.append(body.age)
-                dead += 1
+                died.append(body.id)
             else:
                 survivors.append(body)
         self.bodies = survivors
-        return dead
+        return len(died), died
 
-    def _reproduce(self) -> int:
+    def _reproduce(self) -> tuple[int, list[tuple[int, int]]]:
         """Деление. Тоже локальное событие: тело смотрит только на свою энергию.
 
         max_population — ёмкость среды. Когда места нет, деление просто не
         происходит; никто не вытесняется и никто ни с кем не сравнивается.
         """
-        births = 0
+        born: list[tuple[int, int]] = []
         for body in list(self.bodies):
             if len(self.bodies) >= self.cfg.max_population:
                 break
@@ -343,7 +382,10 @@ class World(ABC):
                 x=cx,
                 y=cy,
                 energy=share,
-                mind=body.mind.spawn(self.rng),
+                # Разум потомка делает сам родитель. Если разумы держит
+                # вызывающий (gym), тело рождается пустым, а о событии
+                # сообщается журналом — мир и тогда не трогает ни один Mind.
+                mind=body.mind.spawn(self.rng) if body.mind is not None else None,
                 born_at=self.tick,
                 parent_id=body.id,
                 generation=body.generation + 1,
@@ -351,8 +393,8 @@ class World(ABC):
             self._on_birth(child, body)
             self.bodies.append(child)
             self.occupancy[cy, cx] += 1
-            births += 1
-        return births
+            born.append((body.id, child.id))
+        return len(born), born
 
     def _move_from(self, x: int, y: int) -> tuple[int, int]:
         dx, dy = ((0, -1), (0, 1), (-1, 0), (1, 0))[int(self.rng.integers(4))]

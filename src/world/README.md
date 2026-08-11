@@ -80,6 +80,95 @@ MindAdapter(agent, world.action_size, rng,
 поменять в `Agent.__init__`: размер входа берётся из `world.observation_size`
 (это 5), а не выводится из `grid_size ** 2`.
 
+## Через gym
+
+Обращение такое же, как к старому `GridWorld`:
+
+```python
+import gymnasium as gym
+from world import register_all
+
+register_all()                      # Life/Forage-v0, Life/Seasons-v0, ...
+env = gym.make("Life/Forage-v0", size=24, render_mode="human")
+obs, info = env.reset(seed=1)
+obs, reward, terminated, truncated, info = env.step(actions)
+```
+
+Именованные аргументы `gym.make` уходят прямо в `Config` мира, так что вся
+физика настраивается оттуда же: `gym.make("Life/Shift-v0", shift_at_age=40)`.
+
+**Как подключаются сценарии.** Реестр в `registry.py` — одна точка правды.
+`register("my_world", MyWorld)` делает мир доступным сразу обоим способам:
+и `make("my_world")`, и `gym.make("Life/MyWorld-v0")`. Дописывать gym-идентификатор
+руками не надо, `register_all()` собирает их из реестра. На это есть тест.
+
+Три места, где мир не помещается в gym, и что с ними сделано:
+
+**Награды нет.** Поле `reward` всегда `0.0` — ровно как в твоём старом
+`GridWorld`. Заполнить его чем-то осмысленным означало бы придумать скаляр
+«хорошо/плохо» и начать его максимизировать, то есть сделать именно то,
+чего проект избегает. Поле существует, потому что его требует подпись
+`step()`; смысла в нём нет.
+
+**Тел много, и их число меняется.** gym рассчитан на одного агента. Поэтому
+наблюдение — последовательность переменной длины (`spaces.Sequence`), а
+действий надо подать столько же, сколько пришло наблюдений, в том же
+порядке. Кто есть кто — в `info["ids"]`. Размер одного наблюдения и одного
+действия удобнее спрашивать у `env.unwrapped.single_observation_space` и
+`single_action_space`.
+
+**Разумы держит вызывающий.** В gym-режиме мир не хранит агентов и не
+вызывает у них ничего, даже `spawn()`. О рождениях и смертях он сообщает
+журналом. Это более строгая граница, чем в `simulate()`:
+
+```python
+obs, info = env.reset(seed=1)
+minds = {i: make_mind(rng) for i in info["ids"]}
+
+while True:
+    actions = [minds[i].act(o) for i, o in zip(info["ids"], obs)]
+    obs, _, terminated, truncated, info = env.step(actions)
+    for parent, child in info["born"]:      # [(родитель, потомок), ...]
+        minds[child] = minds[parent].spawn(rng)
+    for i in info["died"]:
+        del minds[i]
+    if terminated:                          # популяция вымерла
+        break
+```
+
+`terminated=True` — вымирание, единственный способ, которым этот мир
+кончается сам. `truncated` сработает, только если задашь `max_episode_steps`
+в `register_all()`.
+
+Оба пути работают поверх одного и того же мира: `simulate()` удобнее, когда
+популяцию можно доверить миру, gym — когда нужен контроль над каждым тактом.
+
+## Картинка
+
+```bash
+python3 experiments/watch.py --world forage
+python3 experiments/watch.py --world shift --size 16 --fps 8
+```
+
+Палитра взята из твоего `src/env/grid_world.py`. Что показано сверх старого
+рендера:
+
+- **яркость тела** — энергия. Тусклое вот-вот умрёт, и видно это без цифр.
+- **обводка** — поколение. Волна светлых тел по экрану = смена поколений.
+- **красная рамка** — телу сломали сенсомоторику (мир `shift`). Агенту про
+  это не сообщают, а тебе видно.
+- **цвет кружка** — тип еды. В `two_foods` их два, и они различимы на вид,
+  потому что агент их тоже различает.
+
+Arcade требует дисплей. На сервере или в контейнере:
+
+```bash
+xvfb-run -a python3 experiments/watch.py --world forage --frames 200 --save out.png
+```
+
+`render_mode` бывает `"human"` (окно), `"rgb_array"` (кадр numpy),
+`"ansi"` (текст, без arcade и без дисплея вообще).
+
 ## Миры
 
 | имя | что проверяет |
@@ -211,8 +300,15 @@ register("my_world", MyWorld)
 убивает всех, снаружи неотличим от мира, который просто сложный, пока не
 покажешь, что компетентное поведение в нём выживает.
 
+Новый мир виден и `make()`, и gym — реестр один. Проверь, что оба пути
+работают, и добавь мир в списки в тестах.
+
 ## Тесты
 
 ```bash
-python3 -m pytest tests/ -q
+python3 -m pytest tests/ -q               # 93, отрисовка пропускается
+xvfb-run -a python3 -m pytest tests/ -q   # 99, вместе с arcade
 ```
+
+Тесты отрисовки сами определяют, есть ли дисплей, и пропускаются без него —
+падать на машине без иксов они не должны.

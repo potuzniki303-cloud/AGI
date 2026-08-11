@@ -23,6 +23,21 @@
 Смена мира — одна строка: make("seasons"), make("shift"), make("two_foods").
 Смена формы наблюдения — переопредели _build_sensor() или собери сенсор
 из sensors.py и присвой world.sensor до reset().
+
+Второй путь — через gym, обращение как к старому GridWorld:
+
+    import gymnasium as gym
+    from world import register_all
+
+    register_all()                       # Life/Forage-v0, Life/Seasons-v0, ...
+    env = gym.make("Life/Forage-v0", size=24, render_mode="human")
+    obs, info = env.reset(seed=1)
+
+Тут разумы держит вызывающий, а мир сообщает о рождениях и смертях журналом
+в info. Подробности и готовый цикл — в gym_env.py.
+
+gymnasium подтягивается только если ты его попросил: сам по себе мир от него
+не зависит, как и от torch.
 """
 
 from __future__ import annotations
@@ -50,42 +65,29 @@ from .worlds import (
     TwoFoodsWorld,
 )
 
-_REGISTRY: dict[str, type[World]] = {
-    "forage": ForageWorld,
-    "seasons": SeasonsWorld,
-    "patches": PatchesWorld,
-    "shift": ShiftWorld,
-    "two_foods": TwoFoodsWorld,
-}
+from .registry import list_worlds, make, register, world_class
 
 
-def register(name: str, cls: type[World]) -> None:
-    """Добавить свой мир в реестр."""
-    if not issubclass(cls, World):
-        raise TypeError(f"{cls} must subclass World")
-    _REGISTRY[name] = cls
+def __getattr__(name: str):
+    """Ленивый доступ к gym-обёртке.
 
-
-def list_worlds() -> list[str]:
-    return sorted(_REGISTRY)
-
-
-def make(name: str, **overrides) -> World:
-    """Собрать мир по имени. Именованные аргументы идут в его Config.
-
-    Неизвестное имя параметра — это ошибка, а не молчаливое игнорирование:
-    опечатка в физике должна падать, а не тихо менять эксперимент.
+    Импортировать gymnasium при `import world` нельзя: мир самодостаточен и
+    не должен требовать gym от того, кто пользуется собственным циклом.
     """
-    if name not in _REGISTRY:
-        raise KeyError(f"unknown world: {name!r}. available: {list_worlds()}")
-    cls = _REGISTRY[name]
-    return cls(cls.Config(**overrides))
+    if name in ("LifeEnv", "register_all", "gym_id"):
+        from . import gym_env
+
+        return getattr(gym_env, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "make",
     "register",
     "list_worlds",
+    "world_class",
+    "gym_id",
+    "register_all",
     "simulate",
     "History",
     "World",
