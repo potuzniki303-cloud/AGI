@@ -8,6 +8,8 @@ class Layer(nn.Linear):
         super().__init__(in_features, out_features, bias, device=device)
         self.genome = genome or Genome.random(device=device)
 
+        self.device = device
+
     def forward(self, layer_input):
         layer_output = super().forward(layer_input)
 
@@ -16,4 +18,4 @@ class Layer(nn.Linear):
         return layer_output
 
     def mutate(self):
-        return Layer(self.in_features, self.out_features, bias=True, genome=self.genome.mutate())
+        return Layer(self.in_features, self.out_features, bias=True, genome=self.genome.mutate(), device=self.device)
