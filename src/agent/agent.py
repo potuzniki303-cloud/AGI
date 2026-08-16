@@ -6,8 +6,8 @@ from .layer import Layer
 class Agent(nn.Module):
     def __init__(self, input_size: int, output_size: int, device) -> None:
         super().__init__()
-        self.fc1 = Layer(input_size, 15,device=device)
-        self.fc2 = Layer(15, output_size, device=device)
+        self.fc1 = Layer(input_size, 150,device=device)
+        self.fc2 = Layer(150, output_size, device=device)
         self.hidden = torch.zeros(15, device=device)
 
         self.input_size = input_size
@@ -26,7 +26,7 @@ class Agent(nn.Module):
         logits = out[:4]
         self.hidden = out[4:]
 
-        return torch.multinomial(torch.softmax(logits, dim=0).to(self.device), 1).to(self.device)
+        return torch.multinomial(torch.softmax(torch.tanh(logits), dim=0).to(self.device), 1).to(self.device)
 
     def mutate(self) -> 'Agent':
         new_agent = Agent(self.input_size, self.output_size, self.device)

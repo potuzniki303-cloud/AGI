@@ -6,9 +6,15 @@ from world import register_all
 
 register_all()
 
-env = gym.make("Life/Forage-v0", size=24, seed=1, render_mode="human")
+env = gym.make("Life/Patches-v0",
+               size=40,
+               seed=42,
+               initial_population=150,
+               max_food=500,
+               energy_at_birth=80,
+               render_mode="human")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu" if torch.cuda.is_available() else "cpu")
 
 n_in  = env.unwrapped.single_observation_space.shape[0]
 n_act = env.unwrapped.single_action_space.n
@@ -32,3 +38,5 @@ while not truncated and not terminated:
     for observation_index, agent_index in enumerate(info['ids']):
         actions.append(int(agents[agent_index](torch.from_numpy(obs[observation_index]).to(device))))
     obs, _reward_unusable, truncated, terminated, info = env.step(actions)
+
+env.close()

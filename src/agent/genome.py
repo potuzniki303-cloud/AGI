@@ -1,3 +1,4 @@
+import math
 import random
 from typing import Any
 
@@ -37,7 +38,7 @@ class Genome(BaseModel):
             b=self.b + r(),
             c=self.c + r(),
             d=self.d + r(),
-            lr=abs(self.lr + r(1e-4, 5e-5)),
+            lr=self.lr * math.exp(random.gauss(0, 5e-4)),
             device=self.device,
         )
 
