@@ -1,3 +1,5 @@
+import random
+
 import torch
 from torch import nn, Tensor
 
@@ -16,7 +18,7 @@ class Agent(nn.Module):
         self.device = device
 
     @torch.no_grad()
-    def forward(self, observation: Tensor) -> Tensor:
+    def forward(self, observation: Tensor) -> int:
         model_input = observation
 
         inb_hidden_state = self.fc1(model_input)
@@ -25,8 +27,10 @@ class Agent(nn.Module):
 
         logits = out[:4]
         self.hidden = out[4:]
-
-        return torch.multinomial(torch.softmax(torch.tanh(logits), dim=0).to(self.device), 1).to(self.device)
+        try:
+            return int(torch.multinomial(torch.softmax(torch.tanh(logits), dim=0).to(self.device), 1).to(self.device))
+        except RuntimeError:
+            return random.randint(0, 3)
 
     def mutate(self) -> 'Agent':
         new_agent = Agent(self.input_size, self.output_size, self.device)

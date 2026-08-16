@@ -6,13 +6,13 @@ from world import register_all
 
 register_all()
 
-env = gym.make("Life/Patches-v0",
+env = gym.make("Life/Bounty-v0",
                size=40,
                seed=42,
-               initial_population=150,
-               max_food=500,
+               initial_population=30,
+               max_food=10,
                energy_at_birth=80,
-               render_mode="human")
+               render_mode="fullscreen",)
 
 device = torch.device("cpu" if torch.cuda.is_available() else "cpu")
 
@@ -36,7 +36,7 @@ while not truncated and not terminated:
         del agents[died]
     actions = []
     for observation_index, agent_index in enumerate(info['ids']):
-        actions.append(int(agents[agent_index](torch.from_numpy(obs[observation_index]).to(device))))
+        actions.append(agents[agent_index](torch.from_numpy(obs[observation_index]).to(device)))
     obs, _reward_unusable, truncated, terminated, info = env.step(actions)
 
 env.close()

@@ -150,6 +150,9 @@ class World(ABC):
         # мир её пишет, но никогда не читает.
         self._lifespans: list[int] = []
 
+        # Кэш locate(), включается только на время observe_all(). None = выключен.
+        self._sense_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] | None = None
+
         self.sensor: Sensor = self._build_sensor()
         self.action_size = 5 if self.cfg.allow_stay else 4
 
@@ -244,8 +247,18 @@ class World(ABC):
         Снимок один на всех намеренно: если бы тела воспринимали мир
         вперемешку с движением, порядок в списке давал бы преимущество,
         то есть в симуляцию протёк бы отбор по позиции в массиве.
+
+        На время съёма включается кэш locate(). Иначе каждое телогоняло бы
+        np.nonzero по всему полю заново: при 400 телах на поле 200x200 это
+        400 проходов по 40 тысячам клеток за один такт. Кэш безопасен именно
+        здесь и только здесь — пока снимаются наблюдения, мир неподвижен по
+        построению.
         """
-        return [b.id for b in self.bodies], [self.observe(b) for b in self.bodies]
+        self._sense_cache = {}
+        try:
+            return [b.id for b in self.bodies], [self.observe(b) for b in self.bodies]
+        finally:
+            self._sense_cache = None
 
     def apply_actions(self, actions: Sequence[int]) -> StepReport:
         """Физика такта по готовым действиям. Ни одного обращения к Mind,
@@ -450,7 +463,26 @@ class World(ABC):
     def locate(
         self, channel: str, food_type: int | None = None, exclude: Body | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Координаты объектов канала. Используется сенсорами."""
+        """Координаты объектов канала. Используется сенсорами.
+
+        Кэшируется, только когда кэш явно включён в observe_all(); вне его
+        считается заново, чтобы никакой прямой вызов observe() не получил
+        устаревшие координаты.
+        """
+        cache = self._sense_cache
+        # канал агентов зависит от того, кого исключаем, поэтому не кэшируем
+        if cache is not None and channel == "food":
+            key = ("food", food_type)
+            hit = cache.get(key)
+            if hit is None:
+                hit = self._locate_uncached(channel, food_type, exclude)
+                cache[key] = hit
+            return hit
+        return self._locate_uncached(channel, food_type, exclude)
+
+    def _locate_uncached(
+        self, channel: str, food_type: int | None, exclude: Body | None
+    ) -> tuple[np.ndarray, np.ndarray]:
         if channel == "food":
             mask = self.food > 0 if food_type is None else self.food == food_type
             return np.nonzero(mask)

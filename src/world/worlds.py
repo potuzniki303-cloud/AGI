@@ -298,3 +298,169 @@ class TwoFoodsWorld(World):
         else:
             good = self.world_polarity
         return self.cfg.food_energy if food_type == good else self.cfg.toxin_energy
+
+
+# --------------------------------------------------------------- bounty
+
+@dataclass
+class BountyConfig(WorldConfig):
+    bounty_factor: float = 10.0  # во сколько раз больше еды в начале
+    bounty_ticks: int = 3000  # за сколько тактов спадает до нормы
+    # Стартовать надо сразу изобильно, иначе спад начнётся раньше,
+    # чем поле успеет наполниться.
+    initial_food_density: float = 0.28
+
+
+class BountyWorld(World):
+    """Сначала еды в bounty_factor раз больше нормы, потом изобилие уходит.
+
+    Множитель падает линейно от bounty_factor до 1 за bounty_ticks тактов и
+    дальше остаётся единицей — то есть мир плавно превращается в forage.
+
+    Зачем. Это не новая проверка, а РАЗГОН в forage. Холодный старт — самая
+    частая причина, по которой ничего не выходит: вся начальная популяция
+    вымирает раньше, чем эволюция успевает нащупать хоть что-то, и ты видишь
+    «не работает» там, где на самом деле «не успело начаться». Здесь у первых
+    поколений есть фора: в изобильном мире выживает почти кто угодно, зато
+    поколения успевают смениться и накопить разнообразие геномов. К моменту,
+    когда еды становится мало, отбору уже есть из чего выбирать.
+
+    Важно понимать цену: пока изобилие не спало, ДАВЛЕНИЯ НЕТ. Случайное
+    блуждание в начале прибыльно (плотность 0.28 против точки безубыточности
+    0.04), и первые сотни тактов ничего не отбирают. Смотреть на результаты
+    имеет смысл начиная примерно с bounty_ticks, а не раньше.
+
+    Множитель применяется и к потолку еды, и к скорости отрастания: иначе
+    поле не удержало бы изобилие под выеданием.
+    """
+
+    Config = BountyConfig
+    cfg: BountyConfig
+
+    def _bounty(self) -> float:
+        """Множитель изобилия: bounty_factor -> 1.0 линейно."""
+        if self.cfg.bounty_ticks <= 0:
+            return 1.0
+        left = max(0.0, 1.0 - self.tick / self.cfg.bounty_ticks)
+        return 1.0 + (self.cfg.bounty_factor - 1.0) * left
+
+    def _food_cap(self, food_type: int) -> int | None:
+        if self.cfg.max_food is None:
+            return None
+        return int(round(self.cfg.max_food * self._bounty()))
+
+    def _regrow_rate(self) -> float:
+        return self.cfg.regrow_per_step * self._bounty()
+
+    def _on_tick(self) -> None:
+        """Убрать излишек, когда потолок опустился ниже текущего запаса.
+
+        Без этого спад почти не чувствовался бы: потолок ограничивает только
+        прирост, а уже выросшая еда лежала бы на поле, пока её не съедят.
+        """
+        cap = self._food_cap(1)
+        if cap is None:
+            return
+        excess = int(np.count_nonzero(self.food)) - cap
+        if excess <= 0:
+            return
+        ys, xs = np.nonzero(self.food)
+        pick = self.rng.choice(len(ys), size=excess, replace=False)
+        self.food[ys[pick], xs[pick]] = EMPTY
+
+
+# -------------------------------------------------------------- growing
+
+@dataclass
+class GrowingConfig(WorldConfig):
+    start_size: int = 8  # сторона в начале
+    growth_every: int = 200  # каждые N тактов сторона +1
+    # size из базового конфига — это КОНЕЧНЫЙ размер.
+    # Стартовая популяция меньше базовой: 30 тел на 8x8 это 47% занятости
+    # поля, и маленький мир превращался бы в давку вместо разгона.
+    initial_population: int = 12
+
+
+class GrowingWorld(World):
+    """Мир начинается маленьким и растёт до size.
+
+    Каждые growth_every тактов сторона увеличивается на единицу, пока не
+    достигнет cfg.size. Новое пространство появляется по югу и востоку,
+    тела остаются на своих координатах.
+
+    Зачем. Разгон тут устроен геометрией, и меняется НЕ то, что кажется.
+    Замеры при start_size=8, size=24, growth_every=100:
+
+      сторона   занятость поля телами   средний путь до ближайшей еды
+         8               0.47                        2.5
+        14               0.15                        5.8
+        24               0.05                        6.9
+
+    Плотность еды при этом почти не меняется, и популяция тоже — обе
+    держатся своими механизмами: еду подчищает выедание, а численность
+    задаёт скорость отрастания (regrow * food_energy / cost), которая от
+    размера поля не зависит вовсе. Так что «маленький мир = много еды»
+    здесь не работает: еды мало всегда.
+
+    Меняется другое — ДЛИНА ПУТИ до еды, почти втрое. И вот это настоящая
+    проверка: правило, настроившееся на близкие градиенты, должно
+    продолжать работать, когда идти стало вдвое-втрое дальше. Антенна даёт
+    proximity = 1/(1 + L1), то есть на расстоянии 2 сигнал равен 0.33, а на
+    расстоянии 7 — уже 0.125. Сенсорный вход слабеет втрое, и веса,
+    подогнанные под сильный сигнал, окажутся не в том масштабе. Устойчивости
+    к смене масштаба входа не проверяет больше ни один мир.
+
+    Побочно меняется скученность: 47% занятости в начале против 5% в конце.
+    Стартовая популяция поэтому уменьшена до 12 — иначе маленький мир был бы
+    не разгоном, а давкой.
+
+    Читать надо продолжительность жизни. Популяция останется около 30 при
+    любом размере поля, потому что её потолок задаёт еда, а не геометрия.
+
+    Учти: рост меняет топологию тора. Тела, которые были рядом через край,
+    после расширения окажутся далеко друг от друга. Это разрыв, но честный —
+    мир буквально стал больше.
+    """
+
+    Config = GrowingConfig
+    cfg: GrowingConfig
+
+    def __init__(self, cfg: GrowingConfig | None = None) -> None:
+        cfg = cfg if cfg is not None else self.Config()
+        if cfg.start_size > cfg.size:
+            raise ValueError("start_size must not exceed size")
+        if cfg.start_size <= 0:
+            raise ValueError("start_size must be > 0")
+        # size в конфиге — конечная цель; живём мы стартовой стороной
+        self.final_size = cfg.size
+        cfg.size = cfg.start_size
+        super().__init__(cfg)
+
+    def reset(self, mind_factory=None) -> None:
+        # вернуть стартовый размер: прошлый прогон мог оставить мир выросшим
+        self._resize(self.cfg.start_size)
+        super().reset(mind_factory)
+
+    def _on_tick(self) -> None:
+        if self.cfg.size >= self.final_size:
+            return
+        if self.cfg.growth_every > 0 and self.tick % self.cfg.growth_every == 0:
+            self._resize(self.cfg.size + 1)
+
+    def _resize(self, new_size: int) -> None:
+        old = self.cfg.size
+        if new_size == old:
+            return
+        keep = min(old, new_size)
+        food = np.zeros((new_size, new_size), dtype=self.food.dtype)
+        occupancy = np.zeros((new_size, new_size), dtype=self.occupancy.dtype)
+        food[:keep, :keep] = self.food[:keep, :keep]
+        occupancy[:keep, :keep] = self.occupancy[:keep, :keep]
+        self.food = food
+        self.occupancy = occupancy
+        self.cfg.size = new_size
+
+    @property
+    def growth_left(self) -> int:
+        """Сколько ещё расти. Для графиков, в симуляцию не возвращается."""
+        return self.final_size - self.cfg.size

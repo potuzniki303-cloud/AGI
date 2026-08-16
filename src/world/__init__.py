@@ -54,7 +54,11 @@ from .sensors import (
     Sensor,
 )
 from .worlds import (
+    BountyConfig,
+    BountyWorld,
     ForageWorld,
+    GrowingConfig,
+    GrowingWorld,
     PatchesConfig,
     PatchesWorld,
     SeasonsConfig,
@@ -109,6 +113,10 @@ __all__ = [
     "ShiftConfig",
     "TwoFoodsWorld",
     "TwoFoodsConfig",
+    "BountyWorld",
+    "BountyConfig",
+    "GrowingWorld",
+    "GrowingConfig",
     "to_ascii",
     "print_frame",
 ]

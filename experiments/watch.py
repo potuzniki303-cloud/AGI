@@ -46,11 +46,23 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--fps", type=float, default=15.0)
     ap.add_argument("--save", help="сохранить последний кадр в PNG и выйти")
+    ap.add_argument(
+        "--fullscreen", action="store_true",
+        help="во весь экран с ездящей камерой — для больших миров",
+    )
+    ap.add_argument(
+        "--cell", type=int, default=None,
+        help="пикселей на клетку; по умолчанию подбирается под экран",
+    )
+    ap.add_argument("--population", type=int, default=None)
     args = ap.parse_args()
 
     register_all()
-    mode = "rgb_array" if args.save else "human"
-    env = gym.make(gym_id(args.world), size=args.size, seed=args.seed, render_mode=mode)
+    mode = "rgb_array" if args.save else ("fullscreen" if args.fullscreen else "human")
+    kwargs = dict(size=args.size, seed=args.seed, render_mode=mode, render_cell=args.cell)
+    if args.population is not None:
+        kwargs["initial_population"] = args.population
+    env = gym.make(gym_id(args.world), **kwargs)
     env.unwrapped.metadata["render_fps"] = args.fps
 
     obs, info = env.reset(seed=args.seed)
@@ -73,7 +85,7 @@ def main() -> None:
             if terminated:
                 print(f"вымерли на такте {info['tick']}")
                 break
-            if truncated:
+            if truncated or env.unwrapped.closed_by_user:
                 break
     except KeyboardInterrupt:
         print("\nостановлено")

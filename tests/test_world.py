@@ -29,7 +29,9 @@ from world.core import Body, WorldConfig  # noqa: E402
 from world.sensors import AntennaSensor, Interoception, PatchSensor  # noqa: E402
 from world.stubs import GreedyMind, RandomMind  # noqa: E402
 
-ALL_WORLDS = ["forage", "seasons", "patches", "shift", "two_foods"]
+ALL_WORLDS = [
+    "forage", "seasons", "patches", "shift", "two_foods", "bounty", "growing",
+]
 
 
 def random_factory(world):
@@ -445,6 +447,149 @@ def test_shift_shortens_life():
     hs = simulate(make("shift", seed=5), greedy_factory(make("shift")), steps=1500)
     hf = simulate(make("forage", seed=5), greedy_factory(make("forage")), steps=1500)
     assert np.percentile(hs.lifespans, 90) < np.percentile(hf.lifespans, 90)
+
+
+def test_bounty_fades_to_normal():
+    """Изобилие должно спадать ровно до базового потолка и там остаться."""
+    w = make("bounty", seed=1, bounty_factor=10.0, bounty_ticks=300, max_food=16)
+    w.reset(random_factory(w))
+    start_cap = w._food_cap(1)
+    assert start_cap == pytest.approx(160, abs=1)
+
+    caps = []
+    for _ in range(500):
+        w.step()
+        caps.append(w._food_cap(1))
+
+    assert caps[0] > caps[150] > caps[299], "потолок должен падать"
+    assert caps[-1] == 16, "после bounty_ticks должен стоять базовый потолок"
+    assert min(caps) == 16, "потолок не должен уходить ниже базового"
+
+
+def test_bounty_trims_excess_food():
+    """Когда потолок опускается, лишняя еда обязана исчезать сама.
+
+    Иначе спад почти не чувствуется: потолок ограничивает только прирост,
+    а уже выросшая еда лежала бы на поле, пока её кто-нибудь не съест.
+
+    Механизм проверяется напрямую, без тел: пустой мир вымирает на первом
+    же такте, а после вымирания step() выходит сразу и хуки не работают."""
+    w = make("bounty", seed=1, bounty_factor=10.0, bounty_ticks=200, max_food=16)
+    w.reset(random_factory(w))
+
+    w.food[:] = 0
+    w._scatter_food(160, food_type=1)
+    assert int(np.count_nonzero(w.food)) > 100, "в начале должно быть изобильно"
+
+    w.tick = 1000  # изобилие давно кончилось
+    w._on_tick()
+    assert int(np.count_nonzero(w.food)) == 16, "излишек не убран"
+
+
+def test_bounty_food_never_exceeds_current_cap():
+    """Инвариант на живом прогоне: запас никогда не выше текущего потолка."""
+    w = make("bounty", seed=2, bounty_factor=10.0, bounty_ticks=400, max_food=16)
+    w.reset(greedy_factory(w))
+    for _ in range(700):
+        w.step()
+        if w.extinct:
+            break
+        assert int(np.count_nonzero(w.food)) <= w._food_cap(1)
+
+
+def test_bounty_with_zero_ticks_is_plain_forage():
+    w = make("bounty", seed=1, bounty_ticks=0, max_food=16)
+    assert w._food_cap(1) == 16
+    assert w._regrow_rate() == pytest.approx(w.cfg.regrow_per_step)
+
+
+def test_growing_reaches_final_size():
+    w = make("growing", seed=1, start_size=6, size=12, growth_every=50)
+    w.reset(random_factory(w))
+    assert w.cfg.size == 6
+    assert w.food.shape == (6, 6)
+
+    sizes = []
+    for _ in range(600):
+        w.step()
+        sizes.append(w.cfg.size)
+        # массивы обязаны идти в ногу со стороной
+        assert w.food.shape == (w.cfg.size, w.cfg.size)
+        assert w.occupancy.shape == (w.cfg.size, w.cfg.size)
+
+    assert sizes[-1] == 12, "мир должен дорасти до size"
+    assert sizes == sorted(sizes), "сторона не должна уменьшаться по ходу"
+    assert w.growth_left == 0
+
+
+def test_growing_keeps_food_and_bodies_on_resize():
+    """Расширение не должно терять ни еду, ни тела."""
+    w = make("growing", seed=1, start_size=6, size=10, growth_every=10**9)
+    w.reset(random_factory(w))
+    w.food[:] = 0
+    w.food[1, 1] = 1
+    w.food[4, 5 % 6] = 1
+    before_food = int(np.count_nonzero(w.food))
+    before_ids = [b.id for b in w.bodies]
+    before_pos = [(b.y, b.x) for b in w.bodies]
+
+    w._resize(9)
+
+    assert w.food.shape == (9, 9)
+    assert int(np.count_nonzero(w.food)) == before_food
+    assert w.food[1, 1] == 1
+    assert [b.id for b in w.bodies] == before_ids
+    assert [(b.y, b.x) for b in w.bodies] == before_pos, "тела не должны сдвигаться"
+
+
+def test_growing_resets_back_to_start_size():
+    """Второй прогон обязан начинаться с маленького мира, а не с выросшего."""
+    w = make("growing", seed=1, start_size=6, size=12, growth_every=50)
+    w.reset(random_factory(w))
+    for _ in range(600):
+        w.step()
+    assert w.cfg.size == 12
+
+    w.reset(random_factory(w))
+    assert w.cfg.size == 6
+    assert w.food.shape == (6, 6)
+    assert w.occupancy.shape == (6, 6)
+
+
+def test_growing_rejects_bad_sizes():
+    with pytest.raises(ValueError, match="start_size"):
+        make("growing", start_size=30, size=10)
+    with pytest.raises(ValueError, match="start_size"):
+        make("growing", start_size=0, size=10)
+
+
+def test_growing_distance_to_food_increases():
+    """Суть мира: путь до еды растёт вместе со стороной."""
+    def mean_distance(world):
+        ys, xs = np.nonzero(world.food)
+        if ys.size == 0 or not world.bodies:
+            return None
+        out = []
+        for b in world.bodies:
+            dx, dy = world.displacement(b.x, b.y, xs, ys)
+            out.append((np.abs(dx) + np.abs(dy)).min())
+        return float(np.mean(out))
+
+    w = make("growing", seed=1, start_size=8, size=24, growth_every=100)
+    w.reset(greedy_factory(w))
+    early, late = [], []
+    for t in range(1700):
+        w.step()
+        d = mean_distance(w)
+        if d is None:
+            continue
+        if w.cfg.size <= 10:
+            early.append(d)
+        elif w.cfg.size >= 22:
+            late.append(d)
+
+    assert early and late
+    assert np.mean(late) > np.mean(early), "в большом мире идти должно дальше"
 
 
 def test_seasons_modulate_regrowth():

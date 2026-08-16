@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from .core import World
 from .worlds import (
+    BountyWorld,
     ForageWorld,
+    GrowingWorld,
     PatchesWorld,
     SeasonsWorld,
     ShiftWorld,
@@ -25,6 +27,9 @@ _REGISTRY: dict[str, type[World]] = {
     "patches": PatchesWorld,
     "shift": ShiftWorld,
     "two_foods": TwoFoodsWorld,
+    # разгонные: не отдельные проверки, а способ пережить холодный старт
+    "bounty": BountyWorld,
+    "growing": GrowingWorld,
 }
 
 

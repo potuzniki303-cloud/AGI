@@ -102,7 +102,10 @@ class LifeEnv(gym.Env):
     """
 
     metadata = {
-        "render_modes": ["human", "rgb_array", "ansi"],
+        # "fullscreen" — тот же human, но во весь экран и с ездящей камерой.
+        # Нужен для больших миров: поле 500x500 при 28 пикселях на клетку это
+        # окно в 14000 пикселей, которое ни в один экран не влезет.
+        "render_modes": ["human", "fullscreen", "rgb_array", "ansi"],
         "render_fps": 15,
     }
 
@@ -110,11 +113,14 @@ class LifeEnv(gym.Env):
         self,
         world_name: str = "forage",
         render_mode: str | None = None,
+        render_cell: int | None = None,
         **world_kwargs: Any,
     ) -> None:
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"Unsupported render_mode: {render_mode}")
         self.render_mode = render_mode
+        # Пикселей на клетку. None — подобрать так, чтобы мир влез в экран.
+        self.render_cell = render_cell
 
         cls = world_class(world_name)
         self.world_name = world_name
@@ -152,7 +158,7 @@ class LifeEnv(gym.Env):
 
         ids, obs = self.world.observe_all()
         self._ids = ids
-        if self.render_mode == "human":
+        if self.render_mode in ("human", "fullscreen"):
             self.render()
         return tuple(obs), self._info(ids, born=[], died=[])
 
@@ -164,7 +170,7 @@ class LifeEnv(gym.Env):
         ids, obs = self.world.observe_all()
         self._ids = ids
 
-        if self.render_mode == "human":
+        if self.render_mode in ("human", "fullscreen"):
             self.render()
 
         info = self._info(ids, born=report.born, died=report.died)
@@ -183,13 +189,21 @@ class LifeEnv(gym.Env):
 
         from .render_arcade import ArcadeRenderer
 
+        live = self.render_mode in ("human", "fullscreen")
         if self._renderer is None:
             self._renderer = ArcadeRenderer(
                 self.world,
-                visible=(self.render_mode == "human"),
+                visible=live,
                 fps=self.metadata["render_fps"],
+                fullscreen=(self.render_mode == "fullscreen"),
+                cell=self.render_cell,
             )
-        return self._renderer.draw(throttle=(self.render_mode == "human"))
+        return self._renderer.draw(throttle=live)
+
+    @property
+    def closed_by_user(self) -> bool:
+        """Окно закрыли с клавиатуры (ESC/Q). Цикл может это прочесть и выйти."""
+        return self._renderer is not None and self._renderer.closed
 
     def close(self) -> None:
         if self._renderer is not None:
