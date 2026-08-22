@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from phase0 import (  # noqa: E402
-    BudgetProfile, Config, Event, Motor, World, adaptation_curve, run, run_baseline,
+    BudgetProfile, Config, Event, Motor, World, adaptation_curve, build, run,
+    run_baseline,
 )
 from phase0.baselines import GreedySymbolic, RandomAgent  # noqa: E402
 from phase0.body import Body, integrate  # noqa: E402
@@ -378,7 +379,9 @@ def test_regime_b_flips_within_interval():
     cfg = Config(mode=Mode.B)
     world = World(cfg)
     flips = []
-    for _ in range(30_000):
+    # Интервал реверсии 15000-45000 тиков, поэтому прогон должен быть длинным:
+    # на 30000 тиках переворотов могло не случиться ни одного.
+    for _ in range(400_000):
         record = world.step()
         world.inbox.drain()
         if any(e["type"] == "regime_flip" for e in record.events):
@@ -433,8 +436,9 @@ def test_greedy_symbolic_beats_random():
     assert greedy.deaths_per_10k < rand.deaths_per_10k
 
 
-@pytest.mark.parametrize("name", ["random", "greedy_symbolic", "greedy_pixel",
-                                  "linear_pixel", "tabular_q", "small_rnn_bptt"])
+@pytest.mark.parametrize("name", ["random", "greedy_symbolic", "greedy_sustained",
+                                  "greedy_transient", "linear_pixel", "tabular_q",
+                                  "small_rnn_bptt"])
 def test_every_baseline_runs_through_the_contract(name):
     world, metrics = run_baseline(name, Config(difficulty="A1"), ticks=3000)
     assert world.tick == 3000
@@ -631,23 +635,242 @@ def test_instant_adapter_is_not_reported_as_learning():
     мгновенно. Если метрика объявит его обучающимся — она врёт."""
     from phase0.metrics import adaptation_curve, savings
     cfg = Config(mode=Mode.B)
-    _, m = run_baseline("greedy_symbolic", cfg, ticks=60_000)
-    curve = adaptation_curve(m)
+    _, m = run_baseline("greedy_symbolic", cfg, ticks=400_000)
+    curve = adaptation_curve(m, window=cfg.t_adapt_window)
     verdict = savings(curve, curve)["вывод"]
     assert "улучшается" not in verdict, verdict
 
 
 def test_noise_floor_reports_events_per_window():
     from phase0.metrics import noise_floor
-    _, m = run_baseline("greedy_symbolic", Config(mode=Mode.B), ticks=60_000)
-    floor = noise_floor(m)
+    _, m = run_baseline("greedy_symbolic", Config(mode=Mode.B), ticks=200_000)
+    floor = noise_floor(m, window=Config().t_adapt_window)
     assert floor["событий в окне"] > 0
     assert floor["погрешность темпа, %"] > 0
 
 
 def test_error_cost_curve_counts_poison_after_flips():
     from phase0.metrics import error_cost_curve
-    _, m = run_baseline("greedy_pixel", Config(mode=Mode.B), ticks=60_000)
+    _, m = run_baseline("greedy_sustained", Config(mode=Mode.B), ticks=200_000)
     curve = error_cost_curve(m)
     assert len(curve) == len(m.flips)
     assert all(isinstance(c, int) and c >= 0 for _, c in curve)
+
+
+# ======================================================================
+# Покрытие сенсорных каналов бейзлайнами
+# ======================================================================
+
+def test_every_channel_group_is_read_by_some_baseline():
+    """Сторож на дыру, которая уже была: 128 каналов из 150 (весь событийный
+    тракт) не читал ни один бейзлайн, и было неизвестно, пригодны ли они."""
+    from phase0.baselines import READS
+    covered = set().union(*READS.values())
+    for group in ("TRANSIENT", "SUSTAINED", "PROPRIO"):
+        assert group in covered, f"{group} не читает ни один бейзлайн"
+
+
+def test_reads_table_matches_actual_channels_read(): 
+    """Таблица READS должна соответствовать тому, что бейзлайн реально читает,
+    иначе сторож покрытия охраняет фикцию."""
+    from phase0.baselines import READS
+    cfg = Config(difficulty="A1")
+    for name, declared in READS.items():
+        if not declared:
+            continue
+        world = World(cfg)
+        agent = build(name, cfg, world.channels, seed=0)
+        seen: set[str] = set()
+        original = agent.step
+
+        def spy(inbox, outbox, budget, _o=original, _s=seen):
+            for e in inbox:
+                _s.add(world.channels.group_of(e.channel))
+            return _o(inbox, outbox, budget)
+
+        agent.step = spy
+        for _ in range(200):
+            world.step()
+            agent.step(world.inbox.drain(), world.outbox, 1000)
+        assert declared <= seen | {"INTERO"}, f"{name}: заявлено {declared}, видно {seen}"
+
+
+def test_greedy_transient_uses_only_event_channel():
+    """Бейзлайн событийного канала обязан работать, даже если плотные каналы
+    молчат — иначе он проверяет не то, что заявлено."""
+    cfg = Config(difficulty="A1")
+    world = World(cfg)
+    agent = build("greedy_transient", cfg, world.channels, seed=0)
+    for _ in range(3000):
+        world.step()
+        events = [e for e in world.inbox.drain()
+                  if e.channel < world.channels.sustained_start]
+        agent.step(events, world.outbox, 1000)
+    assert world.tick == 3000
+    assert sum(world.eaten_counts.values()) > 0, "на одном событийном канале не ест"
+
+
+def test_transient_baseline_beats_random():
+    _, transient = run_baseline("greedy_transient", Config(difficulty="A1"), ticks=20_000)
+    _, rand = run_baseline("random", Config(difficulty="A1"), ticks=20_000)
+    assert transient.deaths_per_10k < rand.deaths_per_10k
+    assert transient.eat_rate_per_1k > rand.eat_rate_per_1k
+
+
+# ======================================================================
+# Канал истины: пять метрик связывания (Часть 6)
+# ======================================================================
+
+def test_visible_means_actually_seen_not_merely_in_fov():
+    """Регрессия. Раньше `visible` означал «в поле зрения»: все 35 447 записей
+    с occluded_by >= 0 были помечены видимыми, и три метрики связывания из
+    пяти посчитать было нельзя."""
+    world = World(Config(difficulty="A3"))
+    full_but_visible = 0
+    inconsistent = 0
+    saw_full = 0
+    for _ in range(20_000):
+        record = world.step()
+        world.inbox.drain()
+        for it in record.items:
+            if it.visible != (it.visible_receptors > 0):
+                inconsistent += 1
+            if it.occlusion == "full":
+                saw_full += 1
+                if it.visible:
+                    full_but_visible += 1
+    assert inconsistent == 0
+    assert full_but_visible == 0
+    assert saw_full > 0, "за 20000 тиков ни одной полной окклюзии — нечего проверять"
+
+
+def test_occlusion_is_classified_three_ways():
+    world = World(Config(difficulty="A3"))
+    kinds = set()
+    for _ in range(20_000):
+        record = world.step()
+        world.inbox.drain()
+        kinds.update(it.occlusion for it in record.items if it.in_fov)
+    assert kinds == {"none", "partial", "full"}
+
+
+def test_truth_carries_receptor_ownership():
+    """retina_owner — ключ ко всем пяти метрикам: без него склеивание и
+    дробление посчитать нечем."""
+    cfg = Config(difficulty="A3")
+    world = World(cfg)
+    for _ in range(500):
+        record = world.step()
+        world.inbox.drain()
+        assert len(record.retina_owner) == cfg.retina_n
+        live = {i.item_id for i in world.items.visible_items}
+        for owner in record.retina_owner:
+            assert owner == -1 or owner in live
+
+
+def test_all_five_binding_metrics_are_computable():
+    from phase0.binding import BindingTracker, ConnectedComponentSlots
+    cfg = Config(difficulty="A3")
+    world = World(cfg)
+    agent = GreedySymbolic(cfg)
+    tracker, segmenter = BindingTracker(), ConnectedComponentSlots()
+    for _ in range(30_000):
+        agent.observe_symbolic(world)
+        record = world.step()
+        world.inbox.drain()
+        tracker.observe(record, segmenter.slots(world._last_projection.l))
+        agent.step([], world.outbox, 1000)
+    report = tracker.report()
+    for key in ("1. соответствие (доля тиков с биекцией)",
+                "2. смен object_id на эпизод видимости",
+                "3. склеиваний на 1000 тиков",
+                "4. дроблений на 1000 тиков",
+                "5. восстановление после окклюзии"):
+        assert key in report, key
+        assert not isinstance(report[key], str), f"{key} не посчиталась: {report[key]}"
+
+
+def test_binding_tracker_detects_merge_and_split():
+    """Проверка самого прибора на построенных вручную случаях."""
+    from phase0.binding import BindingTracker
+    from phase0.truth import TruthRecord
+
+    def rec(owner):
+        items = []
+        for iid in {o for o in owner if o >= 0}:
+            idx = [i for i, o in enumerate(owner) if o == iid]
+            items.append(ItemTruthStub(iid, min(idx), max(idx), len(idx)))
+        return TruthRecord(tick=0, body={}, items=items, regime={},
+                           retina_owner=list(owner))
+
+    from dataclasses import dataclass
+
+    @dataclass
+    class ItemTruthStub:
+        item_id: int
+        lo: int
+        hi: int
+        n: int
+        visible: bool = True
+        in_fov: bool = True
+        occlusion: str = "none"
+
+    owner = [-1, 0, 0, -1, 1, 1, -1]
+    merged = BindingTracker()
+    merged.observe(rec(owner), {100: {1, 2, 4, 5}})          # один слот на два предмета
+    assert merged.r.merge_events == 1
+
+    split = BindingTracker()
+    split.observe(rec(owner), {100: {1}, 101: {2}, 102: {4, 5}})  # предмет 0 в двух слотах
+    assert split.r.split_events == 1
+
+
+# ======================================================================
+# Валидация конфига
+# ======================================================================
+
+@pytest.mark.parametrize("bad", ["B", 1, None])
+def test_mode_must_be_enum_not_string(bad):
+    """Config(mode="B") раньше проходил молча и падал тысячи тиков спустя
+    внутри канала истины."""
+    with pytest.raises(TypeError):
+        Config(mode=bad)
+
+
+def test_photometry_constants_are_in_meta_snapshot():
+    """d_ref и i_floor раньше были модульными константами retina.py и не
+    попадали в meta.json — то есть защита от тихой подкрутки на них не
+    действовала."""
+    snapshot = Config().snapshot()
+    assert snapshot["d_ref"]["justification"] == "произвол"
+    assert snapshot["i_floor"]["justification"] == "произвол"
+
+
+def test_flip_interval_gives_enough_events_per_window():
+    """Интервал реверсии и темп поедания должны быть согласованы: иначе
+    T_adapt оценивается по единицам событий и ничего не значит."""
+    from phase0.metrics import MIN_POINTS, noise_floor
+    cfg = Config(mode=Mode.B)
+    _, m = run_baseline("greedy_symbolic", cfg, ticks=400_000)
+    floor = noise_floor(m, window=cfg.t_adapt_window)
+    assert floor["событий в окне"] > 20, floor
+    assert floor["погрешность темпа, %"] < 25, floor
+
+
+def test_sustained_on_change_reduces_dense_traffic():
+    from phase0.baselines import GreedyTransient
+    counts = {}
+    for on_change in (False, True):
+        cfg = Config(sustained_on_change=on_change)
+        world = World(cfg)
+        agent = GreedyTransient(cfg, world.channels)
+        dense = 0
+        for _ in range(2000):
+            world.step()
+            events = world.inbox.drain()
+            dense += sum(1 for e in events
+                         if world.channels.sustained_start <= e.channel
+                         < world.channels.proprio_start)
+            agent.step(events, world.outbox, 1000)
+        counts[on_change] = dense
+    assert counts[True] < counts[False]

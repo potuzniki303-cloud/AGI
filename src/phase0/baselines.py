@@ -4,12 +4,18 @@
 считают нужным, и пользуются action-hold. Различаются они ВХОДОМ, и это
 различие принципиально:
 
-  greedy_symbolic — привилегированный вход (позиции предметов). Отвечает на
-                    вопрос «решаема ли задача вообще».
-  greedy_pixel    — только сетчатка. Отвечает на вопрос «решаема ли она из
-                    пикселей».
+  greedy_symbolic  — привилегированный вход (позиции). «Решаема ли задача
+                     вообще?»
+  greedy_sustained — устойчивый канал, 8 рецепторов по 15 градусов.
+  greedy_transient — событийный канал, 32 рецептора по 3.75 градуса.
 
-Смешивать эти два вопроса нельзя, поэтому оба бейзлайна обязаны быть.
+Смешивать эти вопросы нельзя, поэтому все три бейзлайна обязаны быть.
+
+Пара sustained/transient появилась не для симметрии. До неё 128 каналов из
+150 не читал ни один бейзлайн: событийная сетчатка, центральная часть Части 4,
+не проверялась ничем, и было неизвестно, пригодна ли она в принципе. Заодно
+это чинит вывод про «цену пикселей»: один только устойчивый канал видит
+вчетверо грубее самой сетчатки, и разрыв по нему завышен.
 
 Привилегированный вход — свойство ПРИБОРА, не агента. Ни один из этих классов
 не является кандидатом в агенты, и канал истины по-прежнему не попадает
@@ -124,14 +130,17 @@ class GreedySymbolic(BaseAgent):
 
 
 # --------------------------------------------------------------------------
-class GreedyPixel(BaseAgent):
-    """То же намерение, но вход — только сетчатка (устойчивый канал).
+class GreedySustained(BaseAgent):
+    """Вход — только УСТОЙЧИВЫЙ канал: 8 рецепторов по 15 градусов каждый.
 
-    Честное сравнение с greedy_symbolic: разрыв между ними и есть цена
-    того, что мир виден через пиксели, а не дан списком координат.
+    Имя важно. Раньше он назывался greedy_pixel, и это вводило в заблуждение:
+    разрыв с greedy_symbolic списывался на «цену того, что мир виден через
+    сетчатку», хотя сетчатка у мира 32 рецептора по 3.75 градуса, а этот
+    бейзлайн видит вчетверо грубее. Цену пикселей показывает пара
+    greedy_sustained / greedy_transient, а не один из них.
     """
 
-    name = "greedy_pixel"
+    name = "greedy_sustained"
 
     def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
                  k_p: float = 2.0) -> None:
@@ -157,7 +166,7 @@ class GreedyPixel(BaseAgent):
 
         # Питательным считаем kind=A (положительный полюс цветовой оси).
         # Это ЗАШИТО и в режиме B будет неверно ровно половину времени —
-        # именно поэтому greedy_pixel не решает режим B, и это ожидаемо.
+        # именно поэтому пиксельные жадины не решают режим B, и это ожидаемо.
         weight = np.clip(self.c, 0.0, None) * np.clip(self.l, 0.0, None)
         if weight.sum() <= 1e-9:
             self.emit(outbox, Motor.THRUST, 0.1)
@@ -301,6 +310,15 @@ class SmallRnnBptt(BaseAgent):
 
     name = "small_rnn_bptt"
 
+    # НА KILL CRITERION ШАГА 0.8 ЭТОТ БЕЙЗЛАЙН НЕ ОТВЕЧАЕТ.
+    # BPTT здесь настоящий, но обучает только предсказатель следующего кадра.
+    # ПОЛИТИКА подбирается (1+1)-случайным поиском с окном 1800 тиков, то есть
+    # меньше одного решения «принять/отвергнуть» на переворот режима. Плоская
+    # кривая T_adapt(k) у него докажет, что случайный поиск медленнее среды, а
+    # НЕ что backprop страдает катастрофическим забыванием. Для проверки
+    # заявления Части VI нужен конкурент с настоящим policy gradient.
+    answers_reversal_kill_criterion = False
+
     def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
                  hidden: int = 24, bptt: int = 16, lr: float = 1e-2,
                  window: int = 1800, sigma: float = 0.25) -> None:
@@ -378,7 +396,81 @@ class SmallRnnBptt(BaseAgent):
         self.wh -= self.lr * gwh
 
 
+class GreedyTransient(BaseAgent):
+    """Вход — ТОЛЬКО транзиентный канал: 128 событийных каналов, 32 рецептора.
+
+    Зачем он нужен. До него событийная сетчатка — центральная часть Части 4 —
+    не проверялась ни одним бейзлайном: 128 каналов из 150 не были покрыты
+    ни одним замером, и было неизвестно, пригодны ли они в принципе.
+
+    Как работает. Транзиентное событие сообщает ЗНАК и величину изменения
+    сигнала в рецепторе. Складывая их, сигнал восстанавливается — это ровно
+    то, что делают с потоком DVS-камеры:
+
+        est[i, c] += sign * value
+
+    Утечка к нулю нужна потому, что интегратор без неё копит ошибку
+    отброшенных по EVENT_RATE_CAP событий. Она же делает оценку забывчивой:
+    то, что давно не менялось, растворяется. Это честная цена событийного
+    кодирования — статичная сцена не даёт входа, значит и помнить её нечем.
+    """
+
+    name = "greedy_transient"
+
+    def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
+                 k_p: float = 2.0, leak: float = 0.002) -> None:
+        super().__init__(cfg, seed)
+        self.ch = channels
+        self.k_p = k_p
+        self.leak = leak
+        self.n = cfg.retina_n
+        self.est = np.zeros((self.n, cfg.color_channels), dtype=np.float64)
+        self.omega = 0.0
+
+    def step(self, inbox: list[Event], outbox: Queue, budget: int) -> None:
+        ch = self.ch
+        self.est *= 1.0 - self.leak
+        for e in inbox:
+            if e.channel < ch.sustained_start:
+                i, c, _pol = ch.decode_transient(e.channel)
+                self.est[i, c] += e.sign * e.value
+            elif e.channel == ch.OMEGA:
+                self.omega = e.value
+        self._tick += 1
+
+        lum = np.clip(self.est[:, 0], 0.0, None)
+        col = np.clip(self.est[:, 1], 0.0, None)   # положительный полюс = kind A
+        weight = lum * col
+        if weight.sum() <= 1e-9:
+            # Ничего не видно — крутиться выгодно вдвойне: и осмотреться,
+            # и породить события там, где сцена статична.
+            self.emit(outbox, Motor.THRUST, 0.1)
+            self.emit(outbox, Motor.TURN, 0.35)
+            return
+
+        centre = (self.n - 1) / 2.0
+        offset = float((weight * (np.arange(self.n) - centre)).sum() / weight.sum())
+        bearing = offset / centre * math.radians(self.cfg.fov_deg) / 2.0
+
+        self.emit(outbox, Motor.TURN, self.k_p * bearing - 0.3 * self.omega)
+        self.emit(outbox, Motor.THRUST, 1.0 if abs(bearing) < 0.6 else 0.15)
+
+
 BASELINES = {
     c.name: c for c in
-    (RandomAgent, GreedySymbolic, GreedyPixel, LinearPixel, TabularQ, SmallRnnBptt)
+    (RandomAgent, GreedySymbolic, GreedySustained, GreedyTransient,
+     LinearPixel, TabularQ, SmallRnnBptt)
+}
+
+# Что каждый бейзлайн реально читает. Нужно для проверки покрытия каналов:
+# без неё легко получить набор бейзлайнов, ни один из которых не трогает
+# главный сенсорный тракт (так и было — 128 каналов из 150 не проверялись).
+READS: dict[str, frozenset[str]] = {
+    "random": frozenset(),
+    "greedy_symbolic": frozenset(),          # привилегированный вход
+    "tabular_q": frozenset(),                # привилегированный вход
+    "greedy_sustained": frozenset({"SUSTAINED", "PROPRIO"}),
+    "greedy_transient": frozenset({"TRANSIENT", "PROPRIO"}),
+    "linear_pixel": frozenset({"SUSTAINED"}),
+    "small_rnn_bptt": frozenset({"SUSTAINED"}),
 }

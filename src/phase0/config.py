@@ -83,7 +83,11 @@ JUSTIFICATION: dict[str, str] = {
     "event_rate_cap": ARBITRARY,
     "sustained_n": ARBITRARY,
     "tau_sustained": ARBITRARY,
+    "sustained_on_change": "флаг",
+    "sustained_theta": ARBITRARY,
     "walls_visible": ARBITRARY,
+    "d_ref": ARBITRARY,
+    "i_floor": ARBITRARY,
     "fovea_deg": ARBITRARY,
     "periphery_downsample": ARBITRARY,
     "saccade_max_deg": ARBITRARY,
@@ -98,6 +102,7 @@ JUSTIFICATION: dict[str, str] = {
     "mode": "флаг",
     "difficulty": "флаг",
     "flip_interval": CALIB,
+    "t_adapt_window": CALIB,
     "rhythm_period": CALIB,
     "rhythm_window": CALIB,
     "clock": "флаг",
@@ -168,9 +173,29 @@ class Config:
     event_rate_cap: float = 0.20
     sustained_n: int = 8
     tau_sustained: float = 0.100
+    # Устойчивый канал эмитит КАЖДЫЙ тик (16 событий), проприоцепция ещё 4,
+    # энергия 1. Итого 21 плотное событие против ~1.0 транзиентного в тик при
+    # активном движении: событийный канал составляет около 5% объёма входа.
+    # Это делает утверждение 4.4 «статичная сцена даёт ноль входа» неверным —
+    # она даёт 21 событие в тик.
+    # Флаг переводит устойчивый канал на эмиссию по изменению сверх порога.
+    # Выключен: спецификация описывает его как плотный, и менять это молча
+    # нельзя. Включать — как отдельный исследуемый фактор.
+    sustained_on_change: bool = False
+    sustained_theta: float = 0.05
     # Спецификация не говорит, видны ли стены. Оставлено флагом и выключено:
     # включение добавляет ориентиры, которых в спецификации нет (Часть 12).
     walls_visible: bool = False
+    # Фотометрия сетчатки. Спецификация задаёт только «яркость в лог-шкале»,
+    # сама кривая — произвол. Держится здесь, а не модульной константой,
+    # чтобы попадать в meta.json: иначе снимок констант неполон.
+    #   I = 1/(1 + d/d_ref),  L = ln(I + i_floor) - ln(i_floor)
+    # При d_ref=16 спад яркости пологий: всё сближение с 32 у.е. до контакта
+    # даёт около 6 транзиентных событий на рецептор, то есть канал работает
+    # детектором границ и движения, а не дальномером. Уменьшение d_ref делает
+    # его чувствительнее к глубине.
+    d_ref: float = 16.0
+    i_floor: float = 0.05
 
     # --- фовеа (P2) ---
     fovea_deg: float = 30.0
@@ -193,7 +218,21 @@ class Config:
     # --- режимы ---
     mode: Mode = Mode.A
     difficulty: str = "A1"
-    flip_interval: tuple[int, int] = (1500, 4500)
+    # ИЗМЕНЕНИЕ ФИЗИКИ относительно приложения спецификации, с причиной.
+    # Было (1500, 4500). При этом интервале в окно оценки темпа поедания
+    # попадало 3.6 события, то есть погрешность оценки +-53%, и метрика
+    # T_adapt объявляла обучающимся даже greedy_symbolic, который читает
+    # питательность напрямую и не учится ничему.
+    # Замер трёх конфигураций на greedy_symbolic:
+    #   (1500,  4500), окно  600, 200k тиков: 65 измеримых,  3.6 соб/окно, +-53%
+    #   (6000, 18000), окно 2400, 600k тиков: 48 измеримых, 14.2 соб/окно, +-27%
+    #   (15000,45000), окно 6000, 1.2M тиков: 38 измеримых, 36.2 соб/окно, +-17%
+    # Взята третья: и погрешность приемлемая, и выборка выше порога MIN_POINTS.
+    # Обе константы помечены [калибровка], то есть правка законна.
+    flip_interval: tuple[int, int] = (15_000, 45_000)
+    # Окно, по которому оценивается темп поедания в T_adapt. Держится рядом
+    # с flip_interval, потому что осмысленно только вместе с ним.
+    t_adapt_window: int = 6_000
     rhythm_period: int = 180
     rhythm_window: float = 0.3
 
@@ -256,6 +295,21 @@ class Config:
             )
         if self.clock not in ("fast", "realtime"):
             raise ValueError("clock must be 'fast' or 'realtime'")
+        # mode обязан быть Mode, а не строкой. Config(mode="B") раньше проходил
+        # молча и падал тысячи тиков спустя внутри канала истины.
+        if not isinstance(self.mode, Mode):
+            raise TypeError(
+                f"mode должен быть Mode, получено {type(self.mode).__name__}"
+                f" ({self.mode!r}). Используй Mode.A / Mode.B / Mode.C"
+                + (f" или Mode[{self.mode!r}]" if isinstance(self.mode, str) else "")
+            )
+        if not isinstance(self.percept_level, Level):
+            raise TypeError(
+                f"percept_level должен быть Level, получено "
+                f"{type(self.percept_level).__name__} ({self.percept_level!r})"
+            )
+        if self.t_adapt_window <= 0:
+            raise ValueError("t_adapt_window must be > 0")
         if self.flip_interval[0] > self.flip_interval[1]:
             raise ValueError("flip_interval must be (lo, hi) with lo <= hi")
         if self.color_channels != 2:

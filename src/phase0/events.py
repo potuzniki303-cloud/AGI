@@ -94,6 +94,17 @@ class Channels:
     def sustained(self, receptor: int, color: int) -> int:
         return self.sustained_start + receptor * self.cfg.color_channels + color
 
+    def decode_transient(self, channel: int) -> tuple[int, int, int]:
+        """Обратное к transient(): канал -> (рецептор, цвет, полярность)."""
+        idx = channel - self.transient_start
+        polarity = idx % 2
+        rest = idx // 2
+        return rest // self.cfg.color_channels, rest % self.cfg.color_channels, polarity
+
+    def decode_sustained(self, channel: int) -> tuple[int, int]:
+        idx = channel - self.sustained_start
+        return divmod(idx, self.cfg.color_channels)
+
     def group_of(self, channel: int) -> str:
         if channel < self.sustained_start:
             return "TRANSIENT"

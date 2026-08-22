@@ -23,7 +23,8 @@ def build(name: str, cfg: Config, channels: Channels, seed: int = 0) -> Any:
     if name not in BASELINES:
         raise KeyError(f"неизвестный бейзлайн: {name}. есть: {sorted(BASELINES)}")
     cls = BASELINES[name]
-    needs_channels = name in ("greedy_pixel", "linear_pixel", "small_rnn_bptt")
+    needs_channels = name in ("greedy_sustained", "greedy_transient",
+                          "linear_pixel", "small_rnn_bptt")
     return cls(cfg, channels, seed=seed) if needs_channels else cls(cfg, seed=seed)
 
 

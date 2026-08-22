@@ -89,7 +89,7 @@ class RunMetrics:
         self.dropped_events = world.dropped_events
 
 
-def adaptation_curve(metrics: RunMetrics, window: int = 600) -> list[tuple[int, int | None]]:
+def adaptation_curve(metrics: RunMetrics, window: int = 6000) -> list[tuple[int, int | None]]:
     """T_adapt(k) для режима B (Часть 8).
 
     T_adapt(k) — число тиков от k-го переворота до восстановления
@@ -125,7 +125,7 @@ def adaptation_curve(metrics: RunMetrics, window: int = 600) -> list[tuple[int, 
     return out
 
 
-def error_cost_curve(metrics: RunMetrics, window: int = 900) -> list[tuple[int, int]]:
+def error_cost_curve(metrics: RunMetrics, window: int = 9000) -> list[tuple[int, int]]:
     """Стоимость ошибок: сколько ЯДА съедено за окно после k-го переворота.
 
     Спецификация называет это сопутствующей метрикой, но на здешних константах
@@ -143,7 +143,7 @@ def error_cost_curve(metrics: RunMetrics, window: int = 900) -> list[tuple[int, 
     return out
 
 
-def noise_floor(metrics: RunMetrics, window: int = 600) -> dict[str, float]:
+def noise_floor(metrics: RunMetrics, window: int = 6000) -> dict[str, float]:
     """Сколько событий поедания приходится на окно оценки темпа.
 
     Если это единицы, `T_adapt` шумодоминирована и её наклон ничего не
@@ -167,7 +167,10 @@ def savings(curve: list[tuple[int, int | None]],
     """Сбережение: улучшается ли адаптация от переворота к перевороту."""
     vals = [(k, v) for k, v in curve if v is not None]
     if len(vals) < 4:
-        return {"n": len(vals)}
+        # Ключ «вывод» присутствует ВСЕГДА: вызывающий не должен гадать,
+        # есть он или нет, и падать по KeyError на коротком прогоне.
+        return {"n": len(vals),
+                "вывод": f"измеримых переворотов {len(vals)} — считать нечего"}
     half = len(vals) // 2
     first = float(np.mean([v for _, v in vals[:half]]))
     second = float(np.mean([v for _, v in vals[half:]]))

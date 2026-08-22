@@ -238,6 +238,8 @@ class World:
         items: list[ItemTruth] = []
         for item in self.items.items:
             span = proj.spans.get(item.item_id)
+            seen = proj.visible_receptors(item.item_id)
+            in_fov = bool(item.alive and span is not None)
             items.append(
                 ItemTruth(
                     item_id=item.item_id,
@@ -245,8 +247,13 @@ class World:
                     y=item.y,
                     kind=item.kind.name,
                     nutritive=self.regime.nutritive(item.kind, tick),
-                    visible=bool(item.alive and span is not None),
+                    # ВИДНО — значит закрашен хотя бы один рецептор.
+                    # Попадание в поле зрения это отдельный факт (in_fov).
+                    visible=bool(in_fov and seen > 0),
+                    in_fov=in_fov,
                     retinal_span=span,
+                    visible_receptors=seen,
+                    occlusion=proj.occlusion.get(item.item_id, "none"),
                     occluded_by=proj.occluded_by.get(item.item_id, -1),
                 )
             )
@@ -262,6 +269,7 @@ class World:
             regime={"mode": rs.mode, "flag_state": rs.flag_state,
                     "ticks_since_flip": rs.ticks_since_flip,
                     "phase": rs.phase, "window_open": rs.window_open},
+            retina_owner=proj.owner.tolist(),
             events=events_log,
             budget=self._budget,
             losses=losses,

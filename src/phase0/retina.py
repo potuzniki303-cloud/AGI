@@ -21,10 +21,11 @@ from .config import Config, Kind
 from .events import Channels, Event
 from .items import Item
 
-# Опорное расстояние спада яркости и порог темноты. Оба ПРОИЗВОЛ: спецификация
-# задаёт только «яркость в лог-шкале», не саму фотометрию.
-D_REF = 16.0
-I_FLOOR = 0.05
+# Фотометрия переехала в Config (поля `d_ref` и `i_floor`). Держать её
+# модульными константами было ошибкой: спецификация требует, чтобы meta.json
+# содержал ПОЛНЫЙ снимок констант, а числа, живущие вне Config, в него не
+# попадают — то есть защита от тихой подкрутки на них не действует.
+# Значения по умолчанию не изменились.
 
 
 def _wrap(angle: float) -> float:
@@ -34,20 +35,34 @@ def _wrap(angle: float) -> float:
 class Projection:
     """Что попало на сетчатку в этом тике.
 
-    l, c            — (N,) яркость и цветооппонентная ось
-    owner           — (N,) item_id ближайшего предмета в рецепторе, -1 если пусто
-    spans           — item_id -> (first, last) занятый диапазон рецепторов
-    occluded_by     — item_id -> item_id того, кто его перекрыл (или -1)
+    l, c        — (N,) яркость и цветооппонентная ось
+    owner       — (N,) item_id ближайшего предмета в рецепторе, -1 если пусто
+    spans       — item_id -> (first, last): куда предмет ПОПАЛ БЫ, то есть его
+                  угловой размер, обрезанный полем зрения
+    visible     — item_id -> сколько рецепторов он реально занял
+    occluded_by — item_id -> кто его закрыл, -1 если никто
+    occlusion   — item_id -> "none" | "partial" | "full"
+
+    Разделение `spans` и `visible` принципиально. Раньше `spans` писался
+    безусловно, и `visible` означал «в поле зрения», а не «видно»: за 35 447
+    записей с occluded_by >= 0 ВСЕ были помечены видимыми. На таких данных
+    три метрики связывания из пяти (склеивание, дробление, восстановление
+    после окклюзии) посчитать нельзя.
     """
 
-    __slots__ = ("l", "c", "owner", "spans", "occluded_by")
+    __slots__ = ("l", "c", "owner", "spans", "visible", "occluded_by", "occlusion")
 
     def __init__(self, n: int) -> None:
         self.l = np.zeros(n, dtype=np.float64)
         self.c = np.zeros(n, dtype=np.float64)
         self.owner = np.full(n, -1, dtype=np.int64)
         self.spans: dict[int, tuple[int, int]] = {}
+        self.visible: dict[int, int] = {}
         self.occluded_by: dict[int, int] = {}
+        self.occlusion: dict[int, str] = {}
+
+    def visible_receptors(self, item_id: int) -> int:
+        return self.visible.get(item_id, 0)
 
 
 class Retina:
@@ -68,6 +83,7 @@ class Retina:
 
         # Устойчивый канал: ФНЧ по огрублённой сетке.
         self.sustained = np.zeros((cfg.sustained_n, cfg.color_channels), dtype=np.float64)
+        self._sustained_ref = np.zeros_like(self.sustained)
         self._alpha_sustained = cfg.dt / (cfg.tau_sustained + cfg.dt)
         if cfg.sustained_n > n or n % cfg.sustained_n:
             raise ValueError("sustained_n должен делить retina_n нацело")
@@ -94,7 +110,31 @@ class Retina:
         )
         for item in ordered:
             self._paint_item(proj, depth, item, bx, by, theta)
+
+        self._classify_occlusion(proj)
         return proj
+
+    @staticmethod
+    def _classify_occlusion(proj: Projection) -> None:
+        """Кто кем закрыт — считается ПОСЛЕ всей отрисовки.
+
+        На лету это считать нельзя: предмет, закрашенный первым, может быть
+        перекрыт позже, и «частично» от «полностью» уже не отличить.
+        """
+        for item_id, (lo, hi) in proj.spans.items():
+            window = proj.owner[lo:hi + 1]
+            seen = int((window == item_id).sum())
+            width = hi - lo + 1
+            proj.visible[item_id] = seen
+
+            if seen == width:
+                proj.occlusion[item_id] = "none"
+                proj.occluded_by[item_id] = -1
+                continue
+
+            proj.occlusion[item_id] = "full" if seen == 0 else "partial"
+            others = window[(window != item_id) & (window >= 0)]
+            proj.occluded_by[item_id] = int(np.bincount(others).argmax()) if others.size else -1
 
     def _paint_item(self, proj: Projection, depth: np.ndarray, item: Item,
                     bx: float, by: float, theta: float) -> None:
@@ -118,26 +158,21 @@ class Retina:
         if lo > self.n - 1 or hi < 0:
             return
 
-        intensity = 1.0 / (1.0 + dist / D_REF)
-        lum = math.log(intensity + I_FLOOR) - math.log(I_FLOOR)
+        cfg = self.cfg
+        intensity = 1.0 / (1.0 + dist / cfg.d_ref)
+        lum = math.log(intensity + cfg.i_floor) - math.log(cfg.i_floor)
         col = intensity * (1.0 if item.kind is Kind.A else -1.0)
 
-        painted = False
         for i in range(lo, hi + 1):
             if dist < depth[i]:
-                prev_owner = int(proj.owner[i])
-                if prev_owner >= 0:
-                    proj.occluded_by[prev_owner] = item.item_id
                 depth[i] = dist
                 proj.l[i] = lum
                 proj.c[i] = col
                 proj.owner[i] = item.item_id
-                painted = True
 
+        # Угловой размер: куда предмет попал БЫ. Сколько из этого реально
+        # видно — считает _classify_occlusion после всей отрисовки.
         proj.spans[item.item_id] = (lo, hi)
-        if not painted:
-            # Предмет в поле зрения, но целиком закрыт.
-            proj.occluded_by.setdefault(item.item_id, int(proj.owner[lo]))
 
     def _paint_walls(self, proj: Projection, depth: np.ndarray,
                      bx: float, by: float, theta: float) -> None:
@@ -150,9 +185,10 @@ class Retina:
             dist = _ray_to_box(bx, by, ang, w, h)
             if not math.isfinite(dist):
                 continue
-            intensity = 0.25 / (1.0 + dist / D_REF)
+            intensity = 0.25 / (1.0 + dist / self.cfg.d_ref)
             depth[i] = dist
-            proj.l[i] = math.log(intensity + I_FLOOR) - math.log(I_FLOOR)
+            proj.l[i] = (math.log(intensity + self.cfg.i_floor)
+                         - math.log(self.cfg.i_floor))
             proj.c[i] = 0.0
 
     # ------------------------------------------------- транзиентный канал
@@ -211,11 +247,15 @@ class Retina:
         self.sustained += self._alpha_sustained * (target - self.sustained)
 
         events = []
+        on_change = self.cfg.sustained_on_change
         for i in range(self.cfg.sustained_n):
             for c in range(self.cfg.color_channels):
-                events.append(
-                    Event(tick, self.ch.sustained(i, c), float(self.sustained[i, c]))
-                )
+                value = float(self.sustained[i, c])
+                if on_change:
+                    if abs(value - self._sustained_ref[i, c]) <= self.cfg.sustained_theta:
+                        continue
+                    self._sustained_ref[i, c] = value
+                events.append(Event(tick, self.ch.sustained(i, c), value))
         return events
 
     # ------------------------------------------------------------- снапшот
@@ -224,6 +264,7 @@ class Retina:
             "l_ref": self.l_ref.copy(),
             "t_last": self.t_last.copy(),
             "sustained": self.sustained.copy(),
+            "sustained_ref": self._sustained_ref.copy(),
             "dropped": self.dropped_events_total,
         }
 
@@ -231,6 +272,7 @@ class Retina:
         self.l_ref = state["l_ref"].copy()
         self.t_last = state["t_last"].copy()
         self.sustained = state["sustained"].copy()
+        self._sustained_ref = state["sustained_ref"].copy()
         self.dropped_events_total = state["dropped"]
 
 
