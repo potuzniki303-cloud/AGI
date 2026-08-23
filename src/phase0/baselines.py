@@ -59,8 +59,21 @@ class BaseAgent:
             self._held[channel] = value
             outbox.put(Event(self._tick, channel, value))
 
+    def subscription(self, channels: Channels) -> set[int] | None:
+        """Какие сенсорные каналы бейзлайн себе выписывает.
+
+        None означает «все». Важно при METABOLIC_COMPUTE с основой "input":
+        невыписанные каналы не эмитятся и не оплачиваются, то есть отказ от
+        канала — физически возможное решение, а не риторика.
+        """
+        return None
+
     def step(self, inbox: list[Event], outbox: Queue, budget: int) -> None:
         raise NotImplementedError
+
+
+def _range(start: int, count: int) -> set[int]:
+    return set(range(start, start + count))
 
 
 # --------------------------------------------------------------------------
@@ -68,6 +81,9 @@ class RandomAgent(BaseAgent):
     """Нижняя граница. Меняет курс изредка, иначе просто летит."""
 
     name = "random"
+
+    def subscription(self, channels: Channels) -> set[int]:
+        return set()          # не читает ничего
 
     def __init__(self, cfg: Any, seed: int = 0, change_every: int = 30) -> None:
         super().__init__(cfg, seed)
@@ -90,6 +106,9 @@ class GreedySymbolic(BaseAgent):
 
     name = "greedy_symbolic"
     symbolic = True
+
+    def subscription(self, channels: Channels) -> set[int]:
+        return set()          # привилегированный вход, сенсорика не нужна
 
     def __init__(self, cfg: Any, seed: int = 0, k_p: float = 2.5,
                  k_d: float = 0.35) -> None:
@@ -142,6 +161,9 @@ class GreedySustained(BaseAgent):
 
     name = "greedy_sustained"
 
+    def subscription(self, channels: Channels) -> set[int]:
+        return _range(channels.sustained_start, channels.n_sustained) | {channels.OMEGA}
+
     def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
                  k_p: float = 2.0) -> None:
         super().__init__(cfg, seed)
@@ -192,6 +214,9 @@ class LinearPixel(BaseAgent):
 
     name = "linear_pixel"
 
+    def subscription(self, channels: Channels) -> set[int]:
+        return _range(channels.sustained_start, channels.n_sustained)
+
     def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
                  window: int = 1800, sigma: float = 0.25) -> None:
         super().__init__(cfg, seed)
@@ -237,6 +262,9 @@ class TabularQ(BaseAgent):
 
     name = "tabular_q"
     symbolic = True
+
+    def subscription(self, channels: Channels) -> set[int]:
+        return set()          # привилегированный вход
 
     ACTIONS = ((1.0, 0.0), (0.6, 0.7), (0.6, -0.7), (0.0, 1.0), (0.0, -1.0))
 
@@ -309,6 +337,9 @@ class SmallRnnBptt(BaseAgent):
     """
 
     name = "small_rnn_bptt"
+
+    def subscription(self, channels: Channels) -> set[int]:
+        return _range(channels.sustained_start, channels.n_sustained)
 
     # НА KILL CRITERION ШАГА 0.8 ЭТОТ БЕЙЗЛАЙН НЕ ОТВЕЧАЕТ.
     # BPTT здесь настоящий, но обучает только предсказатель следующего кадра.
@@ -416,6 +447,9 @@ class GreedyTransient(BaseAgent):
     """
 
     name = "greedy_transient"
+
+    def subscription(self, channels: Channels) -> set[int]:
+        return _range(channels.transient_start, channels.n_transient) | {channels.OMEGA}
 
     def __init__(self, cfg: Any, channels: Channels, seed: int = 0,
                  k_p: float = 2.0, leak: float = 0.002) -> None:

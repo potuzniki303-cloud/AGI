@@ -64,6 +64,8 @@ JUSTIFICATION: dict[str, str] = {
     "t_respawn": ARBITRARY,
     "respawn_min_dist": ARBITRARY,
     "item_speed_max": CALIB,
+    "n_obstacles": CALIB,
+    "r_obstacle": CALIB,
     "e_max": DERIVED,
     "e_init": ARBITRARY,
     "basal": CALIB,
@@ -74,6 +76,9 @@ JUSTIFICATION: dict[str, str] = {
     "metabolic_compute": "флаг",
     "k_compute": ARBITRARY,
     "node_count_ref": ARBITRARY,
+    "compute_cost_basis": "флаг",
+    "k_input": ARBITRARY,
+    "input_ref": ARBITRARY,
     "percept_level": "флаг",
     "fov_deg": ARBITRARY,
     "retina_n": CALIB,
@@ -150,6 +155,11 @@ class Config:
     t_respawn: int = 120
     respawn_min_dist: float = 8.0
     item_speed_max: float = 3.0
+    # Препятствия (уровень A5). Дают СТАБИЛЬНУЮ окклюзию, без которой пятая
+    # метрика связывания — восстановление идентичности после окклюзии —
+    # меряет почти шум: взаимное перекрытие предметов мимолётно.
+    n_obstacles: int = 4
+    r_obstacle: float = 3.0
 
     # --- гомеостат ---
     e_max: float = 1.0
@@ -162,6 +172,19 @@ class Config:
     metabolic_compute: bool = False
     k_compute: float = 0.01
     node_count_ref: int = 1000
+    # На чём основана метаболическая стоимость вычисления.
+    #   "nodes" — по размеру графа, как в 3.2 спецификации;
+    #   "input" — по ОБЪЁМУ ВХОДА, который агент себе выписал;
+    #   "both"  — сумма.
+    # Вариант "input" существует ради одного вопроса: оправданы ли 128
+    # транзиентных каналов. При выровненных условиях событийный канал не даёт
+    # выигрыша в поведении (см. docs/PHASE0.md 5.9), но несёт 1.92 события в
+    # тик против 64 у плотного той же разрешающей способности. Если плата
+    # берётся за объём входа, эта разница становится физической; если нет —
+    # держать событийный тракт незачем.
+    compute_cost_basis: str = "nodes"
+    k_input: float = 0.01
+    input_ref: int = 64
 
     # --- зрение ---
     percept_level: Level = Level.P0
@@ -287,11 +310,10 @@ class Config:
             raise ValueError("e_init must lie in [0, e_max]")
         if self.difficulty not in ("A1", "A2", "A3", "A4", "A5"):
             raise ValueError(f"unknown difficulty: {self.difficulty}")
-        if self.difficulty == "A5":
-            raise NotImplementedError(
-                "A5 требует непроходимых препятствий, дающих окклюзию — "
-                "их в геометрии мира пока нет. Молча работать как A4 нельзя: "
-                "уровень называется по тому, что он проверяет."
+        if self.difficulty == "A5" and self.n_obstacles <= 0:
+            raise ValueError(
+                "A5 — это уровень С препятствиями. n_obstacles должно быть > 0, "
+                "иначе уровень называется не по тому, что проверяет."
             )
         if self.clock not in ("fast", "realtime"):
             raise ValueError("clock must be 'fast' or 'realtime'")
@@ -310,6 +332,8 @@ class Config:
             )
         if self.t_adapt_window <= 0:
             raise ValueError("t_adapt_window must be > 0")
+        if self.compute_cost_basis not in ("nodes", "input", "both"):
+            raise ValueError("compute_cost_basis must be 'nodes', 'input' or 'both'")
         if self.flip_interval[0] > self.flip_interval[1]:
             raise ValueError("flip_interval must be (lo, hi) with lo <= hi")
         if self.color_channels != 2:

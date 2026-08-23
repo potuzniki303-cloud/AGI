@@ -213,48 +213,125 @@ def sensory() -> None:
 
 
 def binding(ticks: int = 60_000) -> None:
-    """Пять метрик связывания (Часть 6) на опорном сегментаторе.
+    """Пять метрик связывания (Часть 6) на A3 и A5.
 
-    Опорный сегментатор — ПРИБОР, а не кандидат в агенты: он режет сетчатку
-    на непрерывные куски и держит идентичность по перекрытию с прошлым тиком.
-    Его числа нужны как нижняя отметка: столько выбивает тривиальная
-    сегментация без всякой памяти.
+    Опорный сегментатор — ПРИБОР, а не кандидат в агенты: он режет сетчатку на
+    непрерывные куски и держит идентичность по перекрытию с прошлым тиком.
+    Его числа — нижняя отметка: столько выбивает тривиальная сегментация без
+    всякой памяти.
+
+    Зачем оба уровня. На A3 окклюзия мимолётна (предметы движутся и
+    респавнятся), и пятая метрика меряет почти шум. На A5 препятствия стоят,
+    поэтому предмет скрыт столько, сколько агент туда не заходит.
     """
     from phase0.baselines import GreedySymbolic
 
     print(RULE)
     print(f"МЕТРИКИ СВЯЗЫВАНИЯ (Часть 6), {ticks} тиков")
     print(RULE)
-    print()
-    cfg = Config(difficulty="A3")
-    world = World(cfg)
-    agent = GreedySymbolic(cfg)
-    tracker = BindingTracker()
-    segmenter = ConnectedComponentSlots()
-    occl = {"none": 0, "partial": 0, "full": 0}
 
-    for _ in range(ticks):
-        agent.observe_symbolic(world)
-        record = world.step()
-        world.inbox.drain()
-        tracker.observe(record, segmenter.slots(world._last_projection.l))
-        for it in record.items:
-            if it.in_fov:
-                occl[it.occlusion] += 1
-        agent.step([], world.outbox, 1000)
+    for difficulty in ("A3", "A5"):
+        cfg = Config(difficulty=difficulty)
+        world = World(cfg)
+        agent = GreedySymbolic(cfg)
+        tracker = BindingTracker()
+        segmenter = ConnectedComponentSlots()
+        occl = {"none": 0, "partial": 0, "full": 0}
 
-    print("  Окклюзия в канале истины (записей по предметам в поле зрения):")
-    total = sum(occl.values()) or 1
-    for k, v in occl.items():
-        print(f"    {k:8s} {v:8d}  ({100*v/total:4.1f}%)")
+        for _ in range(ticks):
+            agent.observe_symbolic(world)
+            record = world.step()
+            world.inbox.drain()
+            tracker.observe(record, segmenter.slots(world._last_projection.l))
+            for it in record.items:
+                if it.in_fov:
+                    occl[it.occlusion] += 1
+            agent.step([], world.outbox, 1000)
+
+        total = sum(occl.values()) or 1
+        note = " (препятствий нет)" if difficulty == "A3" else \
+               f" ({len(world.obstacles.obstacles)} препятствия)"
+        print()
+        print(f"  --- {difficulty}{note} ---")
+        print("  Окклюзия: " + "  ".join(
+            f"{k} {100*v/total:4.1f}%" for k, v in occl.items()))
+        print("  Опорный сегментатор:")
+        for k, v in tracker.report().items():
+            print(f"    {k}: {v}")
+
     print()
-    print("  Опорный сегментатор (нижняя отметка):")
-    for k, v in tracker.report().items():
-        print(f"    {k}: {v}")
+    print("  Читать так. Все пять метрик считаются. Раньше три из пяти посчитать")
+    print("  было нельзя: visible означал «в поле зрения», а не «видно».")
+    print("  Разница A3 против A5 показывает, чего стоила мимолётность окклюзии:")
+    print("  пятая метрика на A3 меряла в основном перекрытия длиной в доли")
+    print("  секунды, на A5 — настоящее скрытие за препятствием.")
+
+
+def metabolic(ticks: int = 40_000) -> None:
+    """Оправданы ли 128 транзиентных каналов. Часть 3.2 плюс замер.
+
+    Вопрос ребром. При выровненных условиях (одинаковое разрешение, без
+    запаздывания) событийный канал НЕ даёт выигрыша в поведении: 1.67 против
+    1.33 у плотного. Единственное, что у него остаётся, — объём: 1.92 события
+    в тик против 64. Если метаболическая плата берётся за объём входа, эта
+    разница становится физической. Если нет — держать событийный тракт незачем.
+
+    Ответ зависит от k_input, помеченного ПРОИЗВОЛ, поэтому здесь меряется
+    ПОРОГ, на котором сравнение переворачивается, а не один вердикт.
+    """
+    print(RULE)
+    print("МЕТАБОЛИЧЕСКИЙ ТЕСТ СОБЫТИЙНОГО КАНАЛА")
+    print(RULE)
     print()
-    print("  Читать так. Все пять метрик теперь считаются. Раньше три из пяти")
-    print("  посчитать было нельзя: visible означал «в поле зрения», а не")
-    print("  «видно», и все записи с окклюзией были помечены видимыми.")
+
+    matched = dict(difficulty="A1", sustained_n=32, tau_sustained=0.0)
+
+    print("  Объём входа, событий/тик (выписанные каналы):")
+    for name in ("greedy_transient", "greedy_sustained"):
+        cfg = Config(**matched)
+        world, _ = run_baseline(name, cfg, ticks=3000)
+        print(f"    {name:18s} {world.input_rate:6.1f}")
+    print()
+    print("  Смертей/10k при разной плате за объём входа")
+    print("  (условия выровнены: sustained_n=32, tau_sustained=0)")
+    print()
+    print("  Усреднение по 4 сидам МИРА. Именно мира, а не агента: обе жадины")
+    print("  детерминированы, rng в их политике не участвует, и разброс по")
+    print("  agent_seed равен ровно нулю. Усреднять по сиду, который ни на что")
+    print("  не влияет, — способ получить красивую погрешность вместо честной.")
+    print()
+    seeds = (0, 1, 2, 3)
+    print(f"    {'k_input':>9s} | {'greedy_transient':>21s} | {'greedy_sustained':>21s}")
+    flip = None
+    for k in (0.0, 0.002, 0.005, 0.01, 0.02, 0.05):
+        row = []
+        for name in ("greedy_transient", "greedy_sustained"):
+            vals = []
+            for s in seeds:
+                cfg = Config(metabolic_compute=(k > 0), compute_cost_basis="input",
+                             k_input=k, **matched)
+                _, m = run_baseline(name, cfg, ticks=ticks, world_seed=s)
+                vals.append(m.deaths_per_10k)
+            row.append((float(np.mean(vals)), float(np.std(vals))))
+        if flip is None and row[0][0] < row[1][0] - row[1][1]:
+            flip = k
+        print(f"    {k:9.3f} | {row[0][0]:14.2f} ±{row[0][1]:4.2f} | "
+              f"{row[1][0]:14.2f} ±{row[1][1]:4.2f}")
+
+    print()
+    print(f"  basal = {Config().basal}/с — с ним и надо сравнивать k_input.")
+    if flip is not None:
+        print(f"  Событийный канал начинает выигрывать при k_input >= {flip:.3f},")
+        print(f"  то есть когда плата за плотный вход составляет "
+              f"{100*flip/Config().basal:.0f}% от basal.")
+    else:
+        print("  Событийный канал не выиграл ни при какой из проверенных плат.")
+    print()
+    print("  Как это читать. Число k_input — ПРОИЗВОЛ, и решение «удалять ли")
+    print("  128 каналов» им и определяется. Замер говорит только одно: при")
+    print("  нулевой плате за объём входа событийный тракт не нужен, а при")
+    print("  плате порядка десятков процентов от basal — нужен. Выбрать")
+    print("  величину платы должен автор, и это решение по спецификации.")
 
 
 def reversal(ticks: int = 1_200_000) -> None:
@@ -350,6 +427,7 @@ def determinism(ticks: int = 200_000) -> None:
 
 
 SECTIONS = {"baselines": baselines, "economy": economy, "sensory": sensory,
+            "metabolic": metabolic,
             "reversal": reversal, "determinism": determinism,
             "binding": binding}
 

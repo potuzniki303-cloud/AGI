@@ -23,6 +23,7 @@ from .body import Body, integrate
 from .config import Config, Kind, Mode
 from .events import Channels, Event, Motor, Queue
 from .items import ItemField
+from .obstacles import ObstacleField
 from .motor import MotorTract
 from .regimes import Regime
 from .retina import Retina
@@ -44,7 +45,9 @@ class World:
         self.tick = 0
         self.motor = MotorTract(self.cfg)
         self.regime = Regime(self.cfg, self.rng.regime_flips)
-        self.items = ItemField(self.cfg, self.rng.world_layout)
+        self.obstacles = ObstacleField(self.cfg, self.rng.world_layout)
+        self.items = ItemField(self.cfg, self.rng.world_layout,
+                               blocked=self.obstacles.blocks)
         self.retina = Retina(self.cfg, self.channels)
 
         self.body = Body(
@@ -62,12 +65,15 @@ class World:
         self._energy_filt = self.cfg.e_init
         self._alpha_energy = self.cfg.dt / (self.cfg.tau_energy + self.cfg.dt)
 
+        self._delivered = 0
         self._noci_until = -1      # тик, до которого держится боль смерти
         self._noci_impulse = 0.0   # мгновенная боль этого тика
 
         self._deferred: list[Event] = []
         self._node_count = 0
         self._budget = 0
+        self._subscription: set[int] | None = None   # None = все каналы
+        self._input_rate = 0.0
 
         # Счётчики для метрик и канала истины.
         self.deaths = 0
@@ -90,6 +96,27 @@ class World:
     def set_budget(self, node_updates_allowed: int) -> None:
         self._budget = int(node_updates_allowed)
 
+    def subscribe(self, channels: "set[int] | None") -> None:
+        """Агент СООБЩАЕТ, какие сенсорные каналы он себе выписывает.
+
+        Это push, как и set_node_count: мир не идёт к агенту спрашивать.
+        Невыписанные каналы не эмитятся и не оплачиваются.
+
+        Зачем это существует. Без отказа от канала метаболическая плата за
+        объём входа бессмысленна: мир берёт деньги за то, чего агент не
+        просил, и выбора у агента нет. С отказом «не подключать эти
+        рецепторы» становится физически возможным решением, а вопрос
+        «оправданы ли 128 транзиентных каналов» — измеримым.
+
+        None возвращает подписку на всё.
+        """
+        self._subscription = None if channels is None else {int(c) for c in channels}
+
+    @property
+    def input_rate(self) -> float:
+        """Событий, доставленных агенту на прошлом тике."""
+        return self._input_rate
+
     # --------------------------------------------------------------- такт
     def step(self) -> TruthRecord:
         """Один тик. Возвращает строку канала истины (для лога, НЕ для агента)."""
@@ -110,6 +137,8 @@ class World:
         wall_hit = 0
         if self.body.alive:
             wall_hit = integrate(self.body, self.motor.thrust, self.motor.turn, cfg)
+            if self.obstacles:
+                wall_hit = max(wall_hit, self.obstacles.collide(self.body, cfg))
             if wall_hit:
                 self.wall_hits += 1
                 self.body.energy -= cfg.e_wall_hit
@@ -137,7 +166,13 @@ class World:
                 abs(self.motor.thrust) + cfg.turn_cost_ratio * abs(self.motor.turn)
             )
             if cfg.metabolic_compute:
-                drain += cfg.k_compute * (self._node_count / cfg.node_count_ref)
+                basis = cfg.compute_cost_basis
+                if basis in ("nodes", "both"):
+                    drain += cfg.k_compute * (self._node_count / cfg.node_count_ref)
+                if basis in ("input", "both"):
+                    # Плата за объём входа берётся за события ПРОШЛОГО тика:
+                    # текущие ещё не сгенерированы, а брать вперёд нельзя.
+                    drain += cfg.k_input * (self._input_rate / cfg.input_ref)
             self.body.energy -= drain * cfg.dt
             self.body.energy = min(self.body.energy, cfg.e_max)
 
@@ -172,16 +207,29 @@ class World:
                 self.motor.apply(ev)
 
     # ------------------------------------------------------------ сенсоры
+    def _deliver(self, events: list[Event]) -> None:
+        """Положить в inbox только выписанные каналы и посчитать объём."""
+        sub = self._subscription
+        if sub is None:
+            self.inbox.extend(events)
+            self._delivered += len(events)
+            return
+        kept = [e for e in events if e.channel in sub]
+        self.inbox.extend(kept)
+        self._delivered += len(kept)
+
     def _emit_sensory(self, tick: int) -> int:
         cfg, ch = self.cfg, self.channels
         proj = self.retina.project(self.body.x, self.body.y, self.body.theta,
-                                   self.items.visible_items)
+                                   self.items.visible_items,
+                                   self.obstacles.obstacles)
         self._last_projection = proj
 
+        self._delivered = 0
         transient, dropped = self.retina.transient_events(tick, proj)
         self.dropped_events += dropped
-        self.inbox.extend(transient)
-        self.inbox.extend(self.retina.sustained_events(tick, proj))
+        self._deliver(transient)
+        self._deliver(self.retina.sustained_events(tick, proj))
 
         # Проприоцепция: без неё сенсомоторные контингенции неполны —
         # агент не может отличить «мир движется» от «я движусь».
@@ -191,20 +239,21 @@ class World:
         if cfg.sensor_noise_sigma > 0.0:
             self._proprio = self._proprio + self.rng.sensor_noise.normal(
                 0.0, cfg.sensor_noise_sigma, 4)
-        for i, value in enumerate(self._proprio):
-            self.inbox.put(Event(tick, ch.proprio_start + i, float(value)))
+        self._deliver([Event(tick, ch.proprio_start + i, float(v))
+                       for i, v in enumerate(self._proprio)])
 
         # Интероцепция. ENERGY даётся напрямую и это законно: это ощущение
         # себя, а не подсказка про среду.
         self._energy_filt += self._alpha_energy * (self.body.energy - self._energy_filt)
-        self.inbox.put(Event(tick, ch.ENERGY, float(self._energy_filt)))
+        self._deliver([Event(tick, ch.ENERGY, float(self._energy_filt))])
 
         noci = self._noci_impulse
         if tick < self._noci_until:
             noci = max(noci, 1.0)
         if noci > 0.0:
-            self.inbox.put(Event(tick, ch.NOCI, float(noci)))
+            self._deliver([Event(tick, ch.NOCI, float(noci))])
 
+        self._input_rate = float(self._delivered)
         return dropped
 
     # -------------------------------------------------------------- смерть
@@ -219,10 +268,13 @@ class World:
         self.deaths += 1
         events_log.append({"type": "death", "cause": "starvation"})
 
-        self.body.x = float(self.rng.world_layout.uniform(
-            cfg.r_body, cfg.arena[0] - cfg.r_body))
-        self.body.y = float(self.rng.world_layout.uniform(
-            cfg.r_body, cfg.arena[1] - cfg.r_body))
+        for _ in range(256):
+            self.body.x = float(self.rng.world_layout.uniform(
+                cfg.r_body, cfg.arena[0] - cfg.r_body))
+            self.body.y = float(self.rng.world_layout.uniform(
+                cfg.r_body, cfg.arena[1] - cfg.r_body))
+            if not self.obstacles.blocks(self.body.x, self.body.y, cfg.r_body):
+                break
         self.body.theta = float(self.rng.world_layout.uniform(-math.pi, math.pi))
         self.body.vx = self.body.vy = self.body.omega = 0.0
         self.body.energy = cfg.e_init
@@ -284,6 +336,7 @@ class World:
                      self.body.vy, self.body.omega, self.body.energy, self.body.alive),
             "motor": self.motor.state(),
             "items": self.items.state(),
+            "obstacles": self.obstacles.state(),
             "regime": self.regime.snapshot(),
             "retina": self.retina.state(),
             "proprio": self._proprio.copy(),
@@ -304,6 +357,9 @@ class World:
                 "dropped": self.dropped_events,
             },
             "node_count": self._node_count,
+            "subscription": (None if self._subscription is None
+                             else sorted(self._subscription)),
+            "input_rate": self._input_rate,
         }
 
     def restore(self, state: dict[str, Any]) -> None:
@@ -313,6 +369,7 @@ class World:
          self.body.omega, self.body.energy, self.body.alive) = state["body"]
         self.motor.restore(state["motor"])
         self.items.restore(state["items"])
+        self.obstacles.restore(state.get("obstacles", []))
         self.regime.restore(state["regime"])
         self.retina.restore(state["retina"])
         self._proprio = state["proprio"].copy()
@@ -326,6 +383,9 @@ class World:
         self.wall_hits = c["wall_hits"]
         self.dropped_events = c["dropped"]
         self._node_count = state["node_count"]
+        sub = state.get("subscription")
+        self._subscription = None if sub is None else set(sub)
+        self._input_rate = state.get("input_rate", 0.0)
         self.inbox.drain()
         self.outbox.drain()
         self.inbox.extend(Event(*row) for row in state.get("inbox", ()))

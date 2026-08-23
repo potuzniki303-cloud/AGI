@@ -49,8 +49,11 @@ class Item:
 class ItemField:
     """Все предметы арены плюс их респавн."""
 
-    def __init__(self, cfg: Config, rng_layout: np.random.Generator) -> None:
+    def __init__(self, cfg: Config, rng_layout: np.random.Generator,
+                 blocked=None) -> None:
         self.cfg = cfg
+        # blocked(x, y, clearance) -> занята ли точка препятствием.
+        self.blocked = blocked or (lambda x, y, c: False)
         self.moving = cfg.difficulty in MOVING_LEVELS
         self.items: list[Item] = []
 
@@ -76,6 +79,8 @@ class ItemField:
         for _ in range(256):
             x = float(rng.uniform(r, w - r))
             y = float(rng.uniform(r, h - r))
+            if self.blocked(x, y, r):
+                continue
             if avoid is None:
                 return x, y
             if math.hypot(x - avoid[0], y - avoid[1]) >= self.cfg.respawn_min_dist:
@@ -131,6 +136,32 @@ class ItemField:
                 item.y, item.vy = r, -item.vy
             elif item.y > h - r:
                 item.y, item.vy = h - r, -item.vy
+            # Препятствия непроходимы и для предметов. Без этого движущийся
+            # предмет заезжает внутрь и «видно» его оттуда быть не может,
+            # то есть окклюзия в канале истины начинает врать.
+            if self.blocked(item.x, item.y, r):
+                self._push_out(item, r)
+
+    def _push_out(self, item: Item, r: float) -> None:
+        """Вытолкнуть предмет из препятствия и отразить скорость.
+
+        Направление ищем пробами по кругу: точную нормаль знает только
+        препятствие, а ItemField о его форме не осведомлён намеренно —
+        он спрашивает лишь «занято ли здесь».
+        """
+        for scale in (0.5, 1.0, 2.0, 4.0, 8.0):
+            for k in range(8):
+                angle = k * math.pi / 4.0
+                nx, ny = math.cos(angle), math.sin(angle)
+                x = item.x + nx * scale * r
+                y = item.y + ny * scale * r
+                if not self.blocked(x, y, r):
+                    item.x, item.y = x, y
+                    normal = item.vx * nx + item.vy * ny
+                    if normal < 0.0:
+                        item.vx -= 2.0 * normal * nx
+                        item.vy -= 2.0 * normal * ny
+                    return
 
     def consume(self, item: Item, tick: int) -> None:
         item.alive = False

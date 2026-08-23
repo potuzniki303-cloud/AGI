@@ -93,8 +93,13 @@ class Retina:
 
     # ------------------------------------------------------------ проекция
     def project(self, bx: float, by: float, theta: float,
-                items: list[Item]) -> Projection:
-        """Нарисовать предметы на полосе. Ближний перекрывает дальнего."""
+                items: list[Item], obstacles=()) -> Projection:
+        """Нарисовать сцену на полосе. Ближний перекрывает дальнего.
+
+        Препятствия рисуются наравне с предметами: они непроходимы И
+        загораживают обзор. Ахроматические (C=0), поэтому цветовая ось
+        по-прежнему разделяет ровно kind A и kind B.
+        """
         proj = Projection(self.n)
         depth = np.full(self.n, np.inf, dtype=np.float64)
 
@@ -104,12 +109,14 @@ class Retina:
         # Дальние первыми: алгоритм художника. Порядок по (расстояние, item_id) —
         # item_id в ключе, чтобы равные расстояния не зависели от порядка в списке
         # и реплей оставался побитовым.
+        drawable = [(it, it.item_id, it.kind, self.cfg.r_item) for it in items]
+        drawable += [(ob, ob.obstacle_id, None, ob.radius) for ob in obstacles]
         ordered = sorted(
-            items,
-            key=lambda it: (-math.hypot(it.x - bx, it.y - by), -it.item_id),
+            drawable,
+            key=lambda d: (-math.hypot(d[0].x - bx, d[0].y - by), -d[1]),
         )
-        for item in ordered:
-            self._paint_item(proj, depth, item, bx, by, theta)
+        for shape, sid, kind, radius in ordered:
+            self._paint_shape(proj, depth, shape, sid, kind, radius, bx, by, theta)
 
         self._classify_occlusion(proj)
         return proj
@@ -136,11 +143,12 @@ class Retina:
             others = window[(window != item_id) & (window >= 0)]
             proj.occluded_by[item_id] = int(np.bincount(others).argmax()) if others.size else -1
 
-    def _paint_item(self, proj: Projection, depth: np.ndarray, item: Item,
-                    bx: float, by: float, theta: float) -> None:
-        dx, dy = item.x - bx, item.y - by
+    def _paint_shape(self, proj: Projection, depth: np.ndarray, shape,
+                     shape_id: int, kind, radius: float,
+                     bx: float, by: float, theta: float) -> None:
+        dx, dy = shape.x - bx, shape.y - by
         dist = math.hypot(dx, dy)
-        r = self.cfg.r_item
+        r = radius
         if dist <= 1e-9:
             return
 
@@ -161,18 +169,19 @@ class Retina:
         cfg = self.cfg
         intensity = 1.0 / (1.0 + dist / cfg.d_ref)
         lum = math.log(intensity + cfg.i_floor) - math.log(cfg.i_floor)
-        col = intensity * (1.0 if item.kind is Kind.A else -1.0)
+        # Препятствие (kind=None) ахроматично: C=0.
+        col = 0.0 if kind is None else intensity * (1.0 if kind is Kind.A else -1.0)
 
         for i in range(lo, hi + 1):
             if dist < depth[i]:
                 depth[i] = dist
                 proj.l[i] = lum
                 proj.c[i] = col
-                proj.owner[i] = item.item_id
+                proj.owner[i] = shape_id
 
-        # Угловой размер: куда предмет попал БЫ. Сколько из этого реально
+        # Угловой размер: куда объект попал БЫ. Сколько из этого реально
         # видно — считает _classify_occlusion после всей отрисовки.
-        proj.spans[item.item_id] = (lo, hi)
+        proj.spans[shape_id] = (lo, hi)
 
     def _paint_walls(self, proj: Projection, depth: np.ndarray,
                      bx: float, by: float, theta: float) -> None:

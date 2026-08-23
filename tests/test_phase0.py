@@ -679,7 +679,7 @@ def test_reads_table_matches_actual_channels_read():
         if not declared:
             continue
         world = World(cfg)
-        agent = build(name, cfg, world.channels, seed=0)
+        agent = build(name, cfg, world.channels, agent_seed=0)
         seen: set[str] = set()
         original = agent.step
 
@@ -700,7 +700,7 @@ def test_greedy_transient_uses_only_event_channel():
     молчат — иначе он проверяет не то, что заявлено."""
     cfg = Config(difficulty="A1")
     world = World(cfg)
-    agent = build("greedy_transient", cfg, world.channels, seed=0)
+    agent = build("greedy_transient", cfg, world.channels, agent_seed=0)
     for _ in range(3000):
         world.step()
         events = [e for e in world.inbox.drain()
@@ -874,3 +874,182 @@ def test_sustained_on_change_reduces_dense_traffic():
             agent.step(events, world.outbox, 1000)
         counts[on_change] = dense
     assert counts[True] < counts[False]
+
+
+def test_agent_seed_and_world_seed_are_independent():
+    """Ловушка, на которой уже споткнулись: параметр назывался `seed`, уходил
+    только агенту, и разброс по нему легко принять за разброс по мирам."""
+    cfg = Config(difficulty="A1")
+
+    # Разные сиды агента при одном мире: раскладка предметов обязана совпасть.
+    a, _ = run_baseline("random", cfg, ticks=300, agent_seed=0)
+    b, _ = run_baseline("random", cfg, ticks=300, agent_seed=7)
+    assert [i.kind for i in a.items.items] == [i.kind for i in b.items.items]
+
+    # Разный сид мира при одном агенте: мир обязан отличаться.
+    c, _ = run_baseline("random", cfg, ticks=300, agent_seed=0, world_seed=12345)
+    assert (c.body.x, c.body.y) != (a.body.x, a.body.y)
+
+
+def test_world_seed_does_not_leak_into_agent():
+    """world_seed меняет мир, но не поведение агента при фиксированном
+    agent_seed — иначе форк перестаёт быть форком."""
+    cfg = Config(difficulty="A1")
+    from phase0.baselines import RandomAgent
+    first = RandomAgent(cfg, seed=3)
+    second = RandomAgent(cfg, seed=3)
+    seq_a = [first.rng.integers(4) for _ in range(50)]
+    seq_b = [second.rng.integers(4) for _ in range(50)]
+    assert seq_a == seq_b
+
+
+# ======================================================================
+# A5: препятствия и стабильная окклюзия
+# ======================================================================
+
+def test_a5_creates_obstacles():
+    world = World(Config(difficulty="A5"))
+    assert len(world.obstacles.obstacles) == world.cfg.n_obstacles
+
+
+def test_a5_requires_obstacles_to_exist():
+    with pytest.raises(ValueError):
+        Config(difficulty="A5", n_obstacles=0)
+
+
+def test_body_never_ends_inside_obstacle():
+    import math
+    cfg = Config(difficulty="A5")
+    world = World(cfg)
+    agent = GreedySymbolic(cfg)
+    for _ in range(20_000):
+        agent.observe_symbolic(world)
+        world.step()
+        world.inbox.drain()
+        agent.step([], world.outbox, 1000)
+        for o in world.obstacles.obstacles:
+            d = math.hypot(world.body.x - o.x, world.body.y - o.y)
+            assert d >= o.radius + cfg.r_body - 1e-6, "тело провалилось внутрь"
+
+
+def test_items_never_spawn_inside_obstacle():
+    import math
+    cfg = Config(difficulty="A5")
+    world = World(cfg)
+    for _ in range(20_000):
+        world.step()
+        world.inbox.drain()
+        for item in world.items.visible_items:
+            for o in world.obstacles.obstacles:
+                d = math.hypot(item.x - o.x, item.y - o.y)
+                assert d >= o.radius + cfg.r_item - 1e-6
+
+
+def test_obstacles_increase_full_occlusion():
+    """Смысл A5: стабильная окклюзия, без которой пятая метрика меряет шум."""
+    def full_fraction(difficulty):
+        cfg = Config(difficulty=difficulty)
+        world = World(cfg)
+        agent = GreedySymbolic(cfg)
+        counts = {"none": 0, "partial": 0, "full": 0}
+        for _ in range(15_000):
+            agent.observe_symbolic(world)
+            record = world.step()
+            world.inbox.drain()
+            agent.step([], world.outbox, 1000)
+            for it in record.items:
+                if it.in_fov:
+                    counts[it.occlusion] += 1
+        return counts["full"] / max(1, sum(counts.values()))
+
+    assert full_fraction("A5") > full_fraction("A3") * 1.3
+
+
+def test_obstacles_are_achromatic():
+    """Препятствия видны, но цветовая ось по-прежнему разделяет ровно A и B."""
+    from phase0.obstacles import Obstacle
+    from phase0.retina import Retina
+    cfg = Config()
+    retina = Retina(cfg, Channels(cfg))
+    proj = retina.project(32, 32, 0.0, [], [Obstacle(100_000, 42.0, 32.0, 3.0)])
+    mid = cfg.retina_n // 2
+    assert proj.l[mid] > 0.0, "препятствие не видно"
+    assert proj.c[mid] == 0.0, "препятствие окрашено"
+
+
+# ======================================================================
+# Подписка на каналы и метаболическая плата за объём входа
+# ======================================================================
+
+def test_subscription_filters_inbox():
+    cfg = Config()
+    world = World(cfg)
+    ch = world.channels
+    world.subscribe({ch.ENERGY})
+    for _ in range(100):
+        world.step()
+        for e in world.inbox.drain():
+            assert e.channel == ch.ENERGY
+
+
+def test_unsubscribed_channels_are_not_charged():
+    """Отказ от канала обязан быть физически выгоден — иначе метаболический
+    тест ничего не решает: мир берёт плату за то, чего агент не просил."""
+    cfg = Config(metabolic_compute=True, compute_cost_basis="input", k_input=0.1)
+
+    def energy_after(subscription):
+        world = World(cfg)
+        world.subscribe(subscription)
+        # Коротко: если тело успеет умереть, респавн вернёт E_0 и сравнение
+        # абсолютных энергий станет бессмысленным.
+        for _ in range(300):
+            world.step()
+            world.inbox.drain()
+        assert world.deaths == 0
+        return world.body.energy
+
+    assert energy_after(set()) > energy_after(None), \
+        "отказ от каналов не сэкономил энергию"
+
+
+def test_input_rate_reflects_subscription():
+    cfg = Config()
+    world = World(cfg)
+    for _ in range(50):
+        world.step()
+        world.inbox.drain()
+    full = world.input_rate
+
+    lean = World(cfg)
+    lean.subscribe({lean.channels.ENERGY})
+    for _ in range(50):
+        lean.step()
+        lean.inbox.drain()
+    assert lean.input_rate < full
+
+
+def test_every_baseline_declares_a_subscription():
+    from phase0.baselines import BASELINES
+    cfg = Config()
+    world = World(cfg)
+    for name in BASELINES:
+        agent = build(name, cfg, world.channels, agent_seed=0)
+        sub = agent.subscription(world.channels)
+        assert sub is None or isinstance(sub, set), name
+
+
+def test_compute_cost_basis_is_validated():
+    with pytest.raises(ValueError):
+        Config(compute_cost_basis="whatever")
+
+
+def test_metabolic_cost_by_nodes_still_works():
+    """Основа "nodes" — поведение спецификации, менять его молча нельзя."""
+    cfg = Config(metabolic_compute=True, compute_cost_basis="nodes")
+    a, b = World(cfg), World(cfg)
+    b.set_node_count(2000)
+    for _ in range(300):
+        a.step(); a.inbox.drain()
+        b.step(); b.inbox.drain()
+    assert a.deaths == 0 and b.deaths == 0, "смерть смазывает сравнение энергий"
+    assert b.body.energy < a.body.energy
