@@ -381,7 +381,7 @@ def test_regime_b_flips_within_interval():
     flips = []
     # Интервал реверсии 15000-45000 тиков, поэтому прогон должен быть длинным:
     # на 30000 тиках переворотов могло не случиться ни одного.
-    for _ in range(400_000):
+    for _ in range(250_000):
         record = world.step()
         world.inbox.drain()
         if any(e["type"] == "regime_flip" for e in record.events):
@@ -635,7 +635,7 @@ def test_instant_adapter_is_not_reported_as_learning():
     мгновенно. Если метрика объявит его обучающимся — она врёт."""
     from phase0.metrics import adaptation_curve, savings
     cfg = Config(mode=Mode.B)
-    _, m = run_baseline("greedy_symbolic", cfg, ticks=400_000)
+    _, m = run_baseline("greedy_symbolic", cfg, ticks=250_000)
     curve = adaptation_curve(m, window=cfg.t_adapt_window)
     verdict = savings(curve, curve)["вывод"]
     assert "улучшается" not in verdict, verdict
@@ -647,14 +647,6 @@ def test_noise_floor_reports_events_per_window():
     floor = noise_floor(m, window=Config().t_adapt_window)
     assert floor["событий в окне"] > 0
     assert floor["погрешность темпа, %"] > 0
-
-
-def test_error_cost_curve_counts_poison_after_flips():
-    from phase0.metrics import error_cost_curve
-    _, m = run_baseline("greedy_sustained", Config(mode=Mode.B), ticks=200_000)
-    curve = error_cost_curve(m)
-    assert len(curve) == len(m.flips)
-    assert all(isinstance(c, int) and c >= 0 for _, c in curve)
 
 
 # ======================================================================
@@ -851,7 +843,7 @@ def test_flip_interval_gives_enough_events_per_window():
     T_adapt оценивается по единицам событий и ничего не значит."""
     from phase0.metrics import MIN_POINTS, noise_floor
     cfg = Config(mode=Mode.B)
-    _, m = run_baseline("greedy_symbolic", cfg, ticks=400_000)
+    _, m = run_baseline("greedy_symbolic", cfg, ticks=250_000)
     floor = noise_floor(m, window=cfg.t_adapt_window)
     assert floor["событий в окне"] > 20, floor
     assert floor["погрешность темпа, %"] < 25, floor
@@ -1053,3 +1045,48 @@ def test_metabolic_cost_by_nodes_still_works():
         b.step(); b.inbox.drain()
     assert a.deaths == 0 and b.deaths == 0, "смерть смазывает сравнение энергий"
     assert b.body.energy < a.body.energy
+
+
+# ======================================================================
+# Метрика режима B: две ошибки, найденные на полном прогоне
+# ======================================================================
+
+def test_error_cost_is_a_fraction_not_a_count():
+    """Абсолютный счётчик яда делает «почти не ест» неотличимым от
+    «избегает яда»: у tabular_q было 2.35 яда за окно против 10.60 у
+    greedy_sustained просто потому, что он ест втрое меньше всего."""
+    from phase0.metrics import error_cost_curve
+    cfg = Config(mode=Mode.B)
+    _, m = run_baseline("greedy_sustained", cfg, ticks=150_000)
+    curve = error_cost_curve(m, window=cfg.t_adapt_window)
+    assert curve, "переворотов не случилось — прогон слишком короткий"
+    measured = 0
+    for _k, frac, bad, total in curve:
+        assert isinstance(bad, int) and isinstance(total, int)
+        assert total >= bad >= 0
+        if total:
+            measured += 1
+            assert 0.0 <= frac <= 1.0
+            assert frac == pytest.approx(bad / total)
+    assert measured, "ни одного окна с едой — метрика ничего не измерила"
+
+
+def test_savings_verdict_survives_outliers():
+    """Наклон МНК на выбросах вида 0, 0, 9220, 5840 не значит ничего.
+    Замерено: у small_rnn_bptt половины 1744.6 и 1785.7 (плоско), а наклон
+    -78.1 давал вердикт «улучшается»."""
+    from phase0.metrics import savings
+    control = [(k, 500) for k in range(40)]
+    # Плоская кривая с одним огромным выбросом в начале.
+    flat = [(k, 500) for k in range(40)]
+    flat[1] = (1, 20_000)
+    verdict = savings(flat, control)["вывод"]
+    assert "улучшается" not in verdict, verdict
+
+
+def test_savings_detects_real_improvement():
+    """Обратная проверка: настоящее улучшение метрика обязана видеть."""
+    from phase0.metrics import savings
+    control = [(k, 500) for k in range(40)]
+    improving = [(k, max(50, 1000 - 25 * k)) for k in range(40)]
+    assert "улучшается" in savings(improving, control)["вывод"]

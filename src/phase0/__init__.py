@@ -18,13 +18,13 @@ from .events import Channels, Event, Motor, Queue
 from .harness import build, run_baseline
 from .logs import RunLogger
 from .metrics import (RunMetrics, adaptation_curve, error_cost_curve,
-                      noise_floor, savings)
+                      error_cost_summary, noise_floor, savings)
 from .snapshot import clone, fork, load, save
 from .world import World
 
 __all__ = [
     "BudgetProfile", "Channels", "Config", "Event", "Kind", "Level", "Mode",
-    "Motor", "Queue", "RunLogger", "RunMetrics", "World", "adaptation_curve", "error_cost_curve", "noise_floor",
+    "Motor", "Queue", "RunLogger", "RunMetrics", "World", "adaptation_curve", "error_cost_curve", "error_cost_summary", "noise_floor",
     "build", "clone", "fork", "load", "replay", "run", "run_baseline",
     "save", "savings",
 ]

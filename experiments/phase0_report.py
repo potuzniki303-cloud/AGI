@@ -21,11 +21,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from phase0 import (Config, World, adaptation_curve, build, error_cost_curve,  # noqa: E402
+                    error_cost_summary,
                     noise_floor, run_baseline, savings)
 from phase0.config import Kind, Mode  # noqa: E402
 from phase0.driver import replay  # noqa: E402
 from phase0.baselines import GreedySymbolic  # noqa: E402
 from phase0.binding import BindingTracker, ConnectedComponentSlots  # noqa: E402
+from phase0.events import Event  # noqa: E402
 
 RULE = "=" * 92
 ALL = ("random", "greedy_symbolic", "greedy_sustained", "greedy_transient",
@@ -334,6 +336,55 @@ def metabolic(ticks: int = 40_000) -> None:
     print("  величину платы должен автор, и это решение по спецификации.")
 
 
+def prediction(ticks: int = 20_000) -> None:
+    """Линейка для «Фазы 0.5»: с чем сравнивать предсказывающего агента.
+
+    Здесь нет агента. Здесь эталон и проверка, что задача вообще непуста.
+    """
+    from phase0.predict import MeanPredictor, TrivialPredictor, score_predictor
+    from phase0.events import Motor
+
+    print(RULE)
+    print("ПРЕДСКАЗАНИЕ СЕНСОРНОГО ПОТОКА: эталоны и непустота задачи")
+    print(RULE)
+    print()
+
+    def spin(world, tick):
+        if tick == 0:
+            world.outbox.put(Event(world.tick, Motor.TURN, 0.6))
+            world.outbox.put(Event(world.tick, Motor.THRUST, 0.4))
+
+    setups = [
+        ("A3, тело НЕПОДВИЖНО", Config(difficulty="A3"), None),
+        ("A4, тело неподвижно, предметы движутся", Config(difficulty="A4"), None),
+        ("A3, тело движется", Config(difficulty="A3"), spin),
+        ("A4, тело движется, предметы движутся", Config(difficulty="A4"), spin),
+    ]
+
+    print(f"  {'постановка':42s} {'эталон':14s} {'норм.ошибка':>12s} {'движение входа':>15s}")
+    for label, cfg, driver in setups:
+        for maker in (TrivialPredictor, MeanPredictor):
+            pred = maker()
+            s = score_predictor(pred, cfg, ticks=ticks, driver=driver)
+            print(f"  {label:42s} {pred.name:14s} {s.normalised:12.5f} "
+                  f"{s.change_rate:15.4f}")
+        print()
+
+    print("  Читать так. «Движение входа» близко к нулю означает, что")
+    print("  предсказывать НЕЧЕГО: устойчивый канал почти постоянен, и")
+    print("  персистентность идеальна по построению. Сравнивать агента с ней")
+    print("  на такой постановке бессмысленно — он не сможет выиграть, и это")
+    print("  не будет говорить о нём ничего.")
+    print()
+    print("  Отсюда практический вывод для «Фазы 0.5»: агент, который только")
+    print("  смотрит и не двигается, должен смотреть на A4, где движутся")
+    print("  предметы. В статичном мире неподвижный наблюдатель не имеет")
+    print("  задачи вовсе.")
+    print()
+    print("  Второй эталон, running_mean, нужен чтобы отличить «выучил")
+    print("  динамику» от «выучил, что вход почти постоянен».")
+
+
 def reversal(ticks: int = 1_200_000) -> None:
     print(RULE)
     print(f"ШАГ 0.8. Режим B — реверсия. {ticks} тиков ({ticks/60/60:.1f} мин)")
@@ -367,16 +418,13 @@ def reversal(ticks: int = 1_200_000) -> None:
         tag = "  <- КОНТРОЛЬ (адаптируется мгновенно)" if name == "greedy_symbolic" else ""
         s = savings(curve, None if name == "greedy_symbolic" else control_curve)
         shown = " ".join(f"{v}" if v is not None else "—" for _, v in curve[:10])
-        first_half = [c for _, c in errors[:len(errors) // 2]]
-        second_half = [c for _, c in errors[len(errors) // 2:]]
+        cost = error_cost_summary(errors)
         print(f"  {name}{tag}")
         print(f"    переворотов {len(m.flips):3d}  яда всего {m.poison:4d}  "
               f"смертей/10k {m.deaths_per_10k:5.2f}")
         print(f"    T_adapt(k) первые 10: {shown}")
         print(f"    {s}")
-        print(f"    стоимость ошибок (яда за окно после переворота): "
-              f"первая половина {np.mean(first_half):.2f}, "
-              f"вторая {np.mean(second_half):.2f}")
+        print(f"    стоимость ошибок (ДОЛЯ яда среди съеденного за окно): {cost}")
         print()
 
     print("  Стоимость ошибок надёжнее T_adapt на здешних константах: это целые")
@@ -427,6 +475,7 @@ def determinism(ticks: int = 200_000) -> None:
 
 
 SECTIONS = {"baselines": baselines, "economy": economy, "sensory": sensory,
+            "prediction": prediction,
             "metabolic": metabolic,
             "reversal": reversal, "determinism": determinism,
             "binding": binding}

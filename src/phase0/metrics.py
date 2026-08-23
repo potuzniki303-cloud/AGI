@@ -125,22 +125,51 @@ def adaptation_curve(metrics: RunMetrics, window: int = 6000) -> list[tuple[int,
     return out
 
 
-def error_cost_curve(metrics: RunMetrics, window: int = 9000) -> list[tuple[int, int]]:
-    """Стоимость ошибок: сколько ЯДА съедено за окно после k-го переворота.
+def error_cost_curve(metrics: RunMetrics, window: int = 9000
+                     ) -> list[tuple[int, float, int, int]]:
+    """Стоимость ошибок после k-го переворота.
 
-    Спецификация называет это сопутствующей метрикой, но на здешних константах
-    она надёжнее главной: это целые счётчики событий, а не оценка ТЕМПА по
-    горстке событий. См. предупреждение в `adaptation_curve`.
+    Возвращает (k, доля яда, штук яда, всего съедено).
+
+    ДОЛЯ, а не штуки, и это принципиально. Первая версия считала абсолютные
+    счётчики, и на них tabular_q выглядел лучше всех (2.35 яда за окно против
+    10.60 у greedy_sustained) — просто потому, что он почти ничего не ест
+    вообще, смертность 15/10k. «Не ест» неотличимо от «избегает яда», если
+    не делить на общее число съеденного.
+
+    На здешних константах эта метрика надёжнее главной: целые счётчики
+    событий устойчивее оценки ТЕМПА по горстке событий (см. adaptation_curve).
     """
     if not metrics.flips:
         return []
-    bad = np.array([t for t, v in zip(metrics.eat_ticks, metrics.eat_values) if v < 0])
+    ticks = np.array(metrics.eat_ticks)
+    values = np.array(metrics.eat_values)
     out = []
     for k, flip in enumerate(metrics.flips):
         end = min(flip + window,
                   metrics.flips[k + 1] if k + 1 < len(metrics.flips) else metrics.ticks)
-        out.append((k, int(((bad >= flip) & (bad < end)).sum())))
+        window_mask = (ticks >= flip) & (ticks < end)
+        total = int(window_mask.sum())
+        bad = int((window_mask & (values < 0)).sum())
+        out.append((k, bad / total if total else float("nan"), bad, total))
     return out
+
+
+def error_cost_summary(curve: list[tuple[int, float, int, int]]) -> dict[str, float | str]:
+    """Сводка по стоимости ошибок: улучшается ли доля яда со временем."""
+    usable = [(k, frac) for k, frac, _b, total in curve if total > 0]
+    if len(usable) < MIN_POINTS:
+        return {"n": len(usable),
+                "вывод": f"измеримых окон {len(usable)} < {MIN_POINTS}"}
+    half = len(usable) // 2
+    first = float(np.median([f for _k, f in usable[:half]]))
+    second = float(np.median([f for _k, f in usable[half:]]))
+    return {
+        "n": len(usable),
+        "доля яда, первая половина": round(first, 3),
+        "доля яда, вторая половина": round(second, 3),
+        "улучшение": round(first - second, 3),
+    }
 
 
 def noise_floor(metrics: RunMetrics, window: int = 6000) -> dict[str, float]:
@@ -177,11 +206,17 @@ def savings(curve: list[tuple[int, int | None]],
     ks = np.array([k for k, _ in vals], dtype=float)
     ts = np.array([v for _, v in vals], dtype=float)
     slope = float(np.polyfit(ks, ts, 1)[0])
+    # Медианы половин: наклон по МНК на выбросах вида 0, 0, 9220, 5840
+    # не значит ничего. Замерено: у small_rnn_bptt половины 1744.6 и 1785.7
+    # (то есть плоско), а наклон -78.1 — «улучшение», которого нет.
+    med_first = float(np.median(ts[:half]))
+    med_second = float(np.median(ts[half:]))
     out = {
         "n": len(vals),
-        "T_adapt первая половина": round(first, 1),
-        "T_adapt вторая половина": round(second, 1),
-        "наклон": round(slope, 2),
+        "медиана первой половины": round(med_first, 1),
+        "медиана второй половины": round(med_second, 1),
+        "среднее первой/второй": f"{first:.0f}/{second:.0f}",
+        "наклон МНК": round(slope, 2),
     }
     if control is None:
         # Без контроля наклон НЕ является выводом: метрика умеет давать
@@ -197,7 +232,11 @@ def savings(curve: list[tuple[int, int | None]],
         return out
     cslope = float(np.polyfit(np.array([k for k, _ in cvals], dtype=float),
                               np.array([v for _, v in cvals], dtype=float), 1)[0])
+    cts = np.array([v for _, v in cvals], dtype=float)
+    chalf = len(cvals) // 2
+    c_first, c_second = float(np.median(cts[:chalf])), float(np.median(cts[chalf:]))
     out["наклон контроля"] = round(cslope, 2)
+    out["контроль, медианы половин"] = f"{c_first:.0f}/{c_second:.0f}"
 
     # Порог по размеру выборки. При погрешности оценки темпа около +-53%
     # (см. noise_floor) наклон по десятку точек — это не вывод, а гадание.
@@ -208,6 +247,14 @@ def savings(curve: list[tuple[int, int | None]],
                         "наклон не интерпретируется")
         return out
 
-    out["вывод"] = ("адаптация улучшается" if slope < cslope - abs(cslope) * 0.5
+    # Вывод по медианам половин, с поправкой на то, как ведёт себя контроль.
+    # Контроль адаптируется мгновенно, поэтому любое его «улучшение» — это
+    # дрейф самой метрики, и превзойти надо именно его.
+    improvement = med_first - med_second
+    control_improvement = c_first - c_second
+    out["улучшение"] = round(improvement, 1)
+    out["улучшение контроля"] = round(control_improvement, 1)
+    out["вывод"] = ("адаптация улучшается"
+                    if improvement > max(control_improvement, 0.0) + med_first * 0.25
                     else "неотличимо от контроля")
     return out
