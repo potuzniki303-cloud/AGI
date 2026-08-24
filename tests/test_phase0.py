@@ -1090,3 +1090,80 @@ def test_savings_detects_real_improvement():
     control = [(k, 500) for k in range(40)]
     improving = [(k, max(50, 1000 - 25 * k)) for k in range(40)]
     assert "улучшается" in savings(improving, control)["вывод"]
+
+
+# ======================================================================
+# Документация констант: она обязана быть полной и не расходиться с кодом
+# ======================================================================
+
+def _parse_constants_doc() -> dict[str, str]:
+    """Разобрать таблицы docs/CONSTANTS.md в {имя: записанное значение}."""
+    import re
+    text = (ROOT / "docs" / "CONSTANTS.md").read_text(encoding="utf-8")
+    rows = {}
+    for line in text.splitlines():
+        m = re.match(r"\|\s*`(\w+)`\s*\|\s*(.+?)\s*\|", line)
+        if m:
+            rows[m.group(1)] = m.group(2).strip().strip("`")
+    return rows
+
+
+def test_every_constant_is_explained():
+    """Регрессия на реальную дыру: 49 констант из 66 не были упомянуты ни в
+    одном документе, включая k_input, по которому у автора спрашивали решение.
+
+    Константа, которой нет в docs/CONSTANTS.md, роняет этот тест. Это
+    единственный способ не дать дыре открыться заново: разовая вычитка
+    устаревает на следующем же коммите.
+    """
+    import dataclasses
+    documented = _parse_constants_doc()
+    missing = [f.name for f in dataclasses.fields(Config) if f.name not in documented]
+    assert not missing, (
+        f"не объяснены в docs/CONSTANTS.md ({len(missing)}): {missing}")
+
+
+def _same_value(actual, written: str) -> bool:
+    """Сравнить значение из кода с записанным в справочнике.
+
+    Числа сравниваются ЧИСЛЕННО: 0.100 и 0.1 — одно и то же, а писать в
+    справочнике 0.100 нагляднее (сразу видно, что это секунды с точностью
+    до миллисекунд).
+    """
+    if str(actual) == written or repr(actual) == written:
+        return True
+    try:
+        return float(actual) == float(written)
+    except (TypeError, ValueError):
+        return False
+
+
+def test_documented_values_match_config():
+    """Справочник не должен расходиться с кодом: устаревшее число хуже
+    отсутствующего, потому что ему верят."""
+    import dataclasses
+    from enum import IntEnum
+
+    # Поля, чьё значение в таблице описано словами, а не литералом.
+    prose = {"seeds"}
+
+    documented = _parse_constants_doc()
+    cfg = Config()
+    mismatched = []
+    for f in dataclasses.fields(Config):
+        if f.name in prose:
+            continue
+        actual = getattr(cfg, f.name)
+        if isinstance(actual, IntEnum):
+            actual = actual.name
+        written = documented[f.name].strip('"')
+        if _same_value(actual, written):
+            continue
+        mismatched.append((f.name, written, str(actual)))
+    assert not mismatched, f"справочник разошёлся с Config: {mismatched}"
+
+
+def test_claude_md_points_at_the_reference():
+    """Правила должны вести к справочнику: иначе его никто не найдёт."""
+    text = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "CONSTANTS.md" in text
